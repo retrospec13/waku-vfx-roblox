@@ -1,6 +1,6 @@
 # waku-vfx-roblox
 
-[![Watch the wakuVFX trailer](media/trailer-preview.jpg)](media/wakuVFX_trailer.mp4)
+[![Five-second preview: lightning strikes and rising rainbow bricks](media/vfx-preview.gif)](media/wakuVFX_trailer.mp4)
 
 **[Watch the trailer](media/wakuVFX_trailer.mp4)** · [Download the MP4](media/wakuVFX_trailer.mp4?raw=true)
 

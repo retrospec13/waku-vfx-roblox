@@ -7,7 +7,8 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 MODULES = ['Kit', 'Assets', 'CasterState', 'Pose', 'SelfTest',
            'Effects/PrismCleave', 'Effects/CrystalBloom', 'Effects/StormLance',
-           'Effects/EarthRise', 'init']
+           'Effects/EarthRise', 'Effects/ChargeAura', 'Effects/HitBurst', 'Effects/ChargeBeam',
+           'Effects/GhostDash', 'Effects/ImpactFlash', 'init']
 
 def main():
     chunks = [(ROOT / 'tests/mocks.luau').read_text()]

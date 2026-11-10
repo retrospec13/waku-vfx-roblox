@@ -443,4 +443,88 @@ function Kit.flat(ctx: Ctx, name: string, spec: FlatSpec): Flat
 	}
 end
 
+-- textured card at any orientation (wall rings, muzzle rings, mid-air shockwaves): a flat Beam like Kit.flat, but
+-- the caller drives it every frame. set(pos, normal, size, transparency, rotation?) ; size is in studs (unscaled).
+export type Plate = { beam: Beam, set: (Vector3, Vector3, number, number, number?) -> (), hide: () -> () }
+function Kit.plate(ctx: Ctx, name: string, texKey: string, z: number?): Plate
+	local a0, a1 = Kit.att(ctx), Kit.att(ctx)
+	local b = Kit.beam(ctx, a0, a1, texKey, z or 0)
+	b.Name = name
+	b.FaceCamera = false
+	b.Segments = 1
+	b.Enabled = false
+	return {
+		beam = b,
+		set = function(pos: Vector3, normal: Vector3, size: number, transp: number, rot: number?)
+			if transp >= 0.995 or size <= 0 then
+				b.Enabled = false
+				return
+			end
+			local n = if normal.Magnitude > 1e-6 then normal.Unit else Vector3.yAxis
+			local x = n:Cross(Vector3.yAxis)
+			if x.Magnitude < 1e-3 then
+				x = n:Cross(Vector3.xAxis)
+			end
+			x = x.Unit
+			local y = n:Cross(x)
+			if rot then
+				local c, s = math.cos(rot), math.sin(rot)
+				x, y = x * c + y * s, y * c - x * s
+			end
+			a0.CFrame = CFrame.fromMatrix(pos - x * size / 2, x, y)
+			a1.CFrame = CFrame.fromMatrix(pos + x * size / 2, x, y)
+			b.Width0, b.Width1 = size, size
+			b.Transparency = NumberSequence.new(math.clamp(transp, 0, 1))
+			b.Enabled = true
+		end,
+		hide = function()
+			b.Enabled = false
+		end,
+	}
+end
+
+-- camera-facing textured card (glows, flare stars) driven by the effect clock, so it is exact in frozen frames.
+-- set(pos, size, transparency, rotation?, stretch?) ; stretch widens the card (1 = square).
+export type Sprite = { beam: Beam, set: (Vector3, number, number, number?, number?) -> (), hide: () -> () }
+function Kit.sprite(ctx: Ctx, name: string, texKey: string, z: number?): Sprite
+	local a0, a1 = Kit.att(ctx), Kit.att(ctx)
+	local b = Kit.beam(ctx, a0, a1, texKey, z or 0)
+	b.Name = name
+	b.Segments = 1
+	b.Enabled = false
+	return {
+		beam = b,
+		set = function(pos: Vector3, size: number, transp: number, rot: number?, stretch: number?)
+			if transp >= 0.995 or size <= 0 then
+				b.Enabled = false
+				return
+			end
+			local cam = workspace.CurrentCamera :: Camera?
+			local up = if cam then cam.CFrame.UpVector else Vector3.yAxis
+			if rot and cam then
+				up = up * math.cos(rot) + cam.CFrame.RightVector * math.sin(rot)
+			end
+			a0.CFrame = CFrame.new(pos - up * size / 2)
+			a1.CFrame = CFrame.new(pos + up * size / 2)
+			local w = size * (stretch or 1)
+			b.Width0, b.Width1 = w, w
+			b.Transparency = NumberSequence.new(math.clamp(transp, 0, 1))
+			b.Enabled = true
+		end,
+		hide = function()
+			b.Enabled = false
+		end,
+	}
+end
+
+-- CFrame at p whose RightVector is d (Beam curve handles follow an attachment's X axis)
+function Kit.rightTo(p: Vector3, d: Vector3): CFrame
+	local u = if d.Magnitude > 1e-6 then d.Unit else Vector3.xAxis
+	local r = u:Cross(Vector3.yAxis)
+	if r.Magnitude < 1e-3 then
+		r = u:Cross(Vector3.xAxis)
+	end
+	return CFrame.fromMatrix(p, u, r.Unit)
+end
+
 return Kit

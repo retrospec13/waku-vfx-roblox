@@ -1,10 +1,14 @@
 # waku-vfx-roblox
 
+**[Set 2: five new effects, SFX and setup](docs/SET-2.md)** · [Set 1 trailer](media/wakuVFX_trailer.mp4)
+
+[![Set 2 preview](media/set-2-preview.gif)](docs/SET-2.md)
+
 [![Five-second preview: lightning strikes and rising rainbow bricks](media/vfx-preview.gif)](media/wakuVFX_trailer.mp4)
 
 **[Watch the trailer](media/wakuVFX_trailer.mp4)** · [Download the MP4](media/wakuVFX_trailer.mp4?raw=true)
 
-Four editable, client-side Roblox combat effects from **Waku Worldwide**. Built from parts, beams, particles and procedural R15 poses, with no mesh or animation uploads required. GitHub may offer the trailer as a download rather than an inline player.
+Nine editable, client-side Roblox combat effects from **Waku Worldwide**. Built from parts, beams, particles and procedural R15 poses, with no mesh or animation uploads required. GitHub may offer the trailer as a download rather than an inline player.
 
 | Effect | Motion |
 |---|---|
@@ -12,20 +16,27 @@ Four editable, client-side Roblox combat effects from **Waku Worldwide**. Built 
 | **CrystalBloom** | Crystal swirl, star bloom, white-out and shatter |
 | **StormLance** | Charged stab and three rainbow lightning pillars |
 | **EarthRise** | Clap, ground slam, rising voxel pillars and crumble |
+| **ChargeAura** | 0.6 s charge-up, ignition, then a looping body aura with rising sparks, ground ring and flickering core; holds until `handle.stop()` (3 s if left alone) |
+| **HitBurst** | 0.3 s basic-attack hit: contact flash, spikes, tight shock ring, sparks. Pass `seed` per hit to vary a combo |
+| **ChargeBeam** | 0.45 s gather in the hands, then a 0.6 s thick beam with core, sheath, spiral strands, muzzle flare and end burst |
+| **GhostDash** | Five sharp afterimages of the caster's real pose plus a short speed trail. Visuals only: your game moves the character |
+| **ImpactFlash** | Two-frame black/white then inverted impact frame (0.07 s), then colour slams back with a shockwave |
 
 ## Included
 
-- All four effect modules, shared runtime, R15 pose code and demo controls.
+- All nine effect modules, shared runtime, R15 pose code and demo controls.
 - `wakuVFX_demo.rbxlx`, plus demo and library-only Rojo projects.
 - All **16 PNG textures**, their manifest and editable Python generator.
 - [A runnable new-effect walkthrough](docs/NEW_EFFECT.md), optional assistant skill and [test instructions](TESTS.md).
-- The supplied trailer. Capture, trailer editing and audio production tools are not part of this source kit.
+- Both trailers and preview GIFs.
+- Set 2 ElevenLabs SFX in `audio/`, plus optional `Sounds.luau` playback and demo integration. See [Set 2 audio setup](docs/SET-2.md#elevenlabs-sfx-and-playback).
+- Capture and trailer editing tools are not part of this source kit.
 
 ## Quick start
 
 1. Open `wakuVFX_demo.rbxlx` in Roblox Studio.
 2. **Upload your own copies of the included textures and replace the IDs**, as below.
-3. Use an R15 avatar, press **Play**, then **1 / 2 / 3 / 4**. Gamepad: X / Y / B / A. Touch: on-screen buttons.
+3. Use an R15 avatar, press **Play**, then **1 / 2 / 3 / 4**. Gamepad: X / Y / B / A. Touch: on-screen buttons. Keys **5 to 9** play ChargeAura (press again to drop it), HitBurst, ChargeBeam, GhostDash and ImpactFlash.
 
 To use the kit in an existing game, copy **the `ReplicatedStorage.wakuVFX` ModuleScript with all its children** from the demo. It is not a plain Folder. Call it from a LocalScript:
 
@@ -53,6 +64,13 @@ These are visuals, not damage, authoritative movement or replication. PrismCleav
 | CrystalBloom | Authored size scaling | Base palette controls | Not used | Disables scene tint |
 | StormLance | Authored size scaling | Base palette controls | R15 pose | Disables scene tint |
 | EarthRise | Ignored | Ignored; always rainbow | R15 pose | Not used |
+| ChargeAura | Authored size scaling | Base palette controls | Followed, not posed | Not used |
+| HitBurst | Authored size scaling | Base palette controls | Not used | Not used |
+| ChargeBeam | Authored size scaling | Base palette controls | R15 pose | Not used |
+| GhostDash | Authored size scaling | Base palette controls | Copied for afterimages, not posed | Not used |
+| ImpactFlash | Authored size scaling | Base palette controls | Silhouetted, not posed | Skips the black/white frames |
+
+`cf` conventions for the newer five: ChargeAura takes the caster's root CFrame; HitBurst and ImpactFlash take the contact point with LookVector along the blow; ChargeBeam and GhostDash take the caster's root CFrame facing the shot or dash. ChargeBeam raycasts up to 70 studs and ends on what it hits. ImpactFlash's two frame grades are tunable in `ImpactFlash.FRAME1` / `FRAME2`.
 
 `rainbow=false` stops base-hue time cycling; spatial rainbow offsets remain. `hue=0.55` is a palette offset, **not a uniform fixed colour**. Scaling is authored per effect, not a universal character/world transform. `seed` controls seeded variation (default 7). `waku.timeScale` is nil/1 for normal playback, 0.5 for slow motion, 0 for screenshots. There is no shipped fixed-step capture API.
 
@@ -96,4 +114,4 @@ The generator reproduces all 16 supplied textures. To make your first visible ef
 Code and documentation: **[MIT](LICENSE)**, copyright Waku Worldwide.
 Owned generated textures in `textures/`: **[CC BY 4.0](LICENSE-TEXTURES.md)**, attribution **“wakuVFX textures by Waku Worldwide”**. You may modify and commercially reuse those licensed files under their respective terms. Roblox accounts, original hosted assets and group access are not transferred.
 
-The supplied trailer is included for preview, separately from the code and texture grants. See [NOTICE.md](NOTICE.md).
+Included ElevenLabs sound files: [audio reuse grant](LICENSE-AUDIO.md). The trailers are included for preview, separately from the code, texture and standalone audio grants. See [NOTICE.md](NOTICE.md).

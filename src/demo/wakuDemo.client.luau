@@ -1,5 +1,6 @@
 --!strict
--- wakuVFX demo: press 1 PrismCleave, 2 CrystalBloom, 3 StormLance, 4 EarthRise on your own character (gamepad: X/Y/B/A).
+-- wakuVFX demo: press 1 PrismCleave, 2 CrystalBloom, 3 StormLance, 4 EarthRise on your own character (gamepad: X/Y/B/A),
+-- 5 ChargeAura (press again to drop it), 6 HitBurst, 7 ChargeBeam, 8 GhostDash, 9 ImpactFlash (keyboard only).
 -- Client-only visuals. For multiplayer, send one RemoteEvent and call waku.play on every client.
 local ContextActionService = game:GetService("ContextActionService")
 local Players = game:GetService("Players")
@@ -16,7 +17,15 @@ local BIND = {
 	{ fx = "CrystalBloom", keys = { Enum.KeyCode.Two, Enum.KeyCode.ButtonY }, title = "Ice" },
 	{ fx = "StormLance", keys = { Enum.KeyCode.Three, Enum.KeyCode.ButtonB }, title = "Bolt" },
 	{ fx = "EarthRise", keys = { Enum.KeyCode.Four, Enum.KeyCode.ButtonA }, title = "Earth" },
+	{ fx = "ChargeAura", keys = { Enum.KeyCode.Five }, title = "Aura" },
+	{ fx = "HitBurst", keys = { Enum.KeyCode.Six }, title = "Hit" },
+	{ fx = "ChargeBeam", keys = { Enum.KeyCode.Seven }, title = "Beam" },
+	{ fx = "GhostDash", keys = { Enum.KeyCode.Eight }, title = "Dash" },
+	{ fx = "ImpactFlash", keys = { Enum.KeyCode.Nine }, title = "Impact" },
 }
+local POSED = { PrismCleave = true, StormLance = true, EarthRise = true, ChargeBeam = true } -- one posed clone at a time
+local aura: any = nil
+local combo = 0
 local busy: { [string]: boolean } = {}
 
 local function groundUnder(char: Model, pos: Vector3): Vector3
@@ -25,6 +34,25 @@ local function groundUnder(char: Model, pos: Vector3): Vector3
 	params.FilterType = Enum.RaycastFilterType.Exclude
 	local hit = Workspace:Raycast(pos, Vector3.new(0, -20, 0), params)
 	return if hit then hit.Position else pos - Vector3.new(0, 3, 0)
+end
+
+-- GhostDash is visuals only: the game moves the character. Here the demo slides it 14 studs, stopping short of walls.
+local function demoDash(char: Model, hrp: BasePart, look: Vector3)
+	local params = RaycastParams.new()
+	params.FilterDescendantsInstances = { char }
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local hit = Workspace:Raycast(hrp.Position, look * 15, params)
+	local dist = if hit then math.max(0, (hit.Position - hrp.Position).Magnitude - 2) else 14
+	local from, t0 = hrp.CFrame, os.clock()
+	local conn: RBXScriptConnection
+	conn = RunService.Heartbeat:Connect(function()
+		local u = math.clamp((os.clock() - t0) / 0.22, 0, 1)
+		hrp.CFrame = from + look * dist * (u * u * (3 - 2 * u))
+		hrp.AssemblyLinearVelocity = Vector3.zero
+		if u >= 1 then
+			conn:Disconnect()
+		end
+	end)
 end
 
 local function cast(fx: string)
@@ -36,12 +64,33 @@ local function cast(fx: string)
 	local look = hrp.CFrame.LookVector * Vector3.new(1, 0, 1)
 	look = if look.Magnitude > 1e-3 then look.Unit else Vector3.new(0, 0, -1)
 	-- moves that pose the caster share one lock (one posed clone at a time)
-	local key = if fx == "CrystalBloom" then fx else "pose"
+	local key = if POSED[fx] then "pose" else fx
 	if busy[key] then
 		return
 	end
 	local h
-	if fx == "PrismCleave" then
+	local front = hrp.Position + look * 3.2 + Vector3.new(0, 0.8, 0) -- where a punch would land
+	if fx == "ChargeAura" then
+		if aura and aura.alive() then
+			aura.stop()
+			aura = nil
+			return
+		end
+		h = waku.play(fx, hrp.CFrame, { caster = char })
+		aura = h
+	elseif fx == "HitBurst" then
+		combo += 1
+		h = waku.play(fx, CFrame.lookAt(front, front + look), { seed = combo })
+	elseif fx == "ImpactFlash" then
+		h = waku.play(fx, CFrame.lookAt(front, front + look), { caster = char })
+	elseif fx == "ChargeBeam" then
+		h = waku.play(fx, CFrame.lookAt(hrp.Position, hrp.Position + look), { caster = char })
+	elseif fx == "GhostDash" then
+		h = waku.play(fx, CFrame.lookAt(hrp.Position, hrp.Position + look), { caster = char })
+		if h then
+			demoDash(char, hrp, look)
+		end
+	elseif fx == "PrismCleave" then
 		h = waku.play(fx, CFrame.lookAt(hrp.Position, hrp.Position + look), { caster = char })
 	elseif fx == "EarthRise" then
 		local g = groundUnder(char, hrp.Position)
@@ -53,7 +102,11 @@ local function cast(fx: string)
 		local g = groundUnder(char, hrp.Position + look * 12)
 		h = waku.play(fx, CFrame.new(g))
 	end
-	if h and fx ~= "CrystalBloom" then
+	if h then
+		local sounds = require(ReplicatedStorage.wakuVFX.Sounds)
+		sounds.play(fx, hrp, h)
+	end
+	if h and POSED[fx] then
 		busy[key] = true
 		task.delay(h.life + 0.1, function()
 			busy[key] = nil
@@ -82,6 +135,6 @@ for _, b in BIND do
 			return Enum.ContextActionResult.Sink
 		end
 		return Enum.ContextActionResult.Pass
-	end, true, table.unpack(b.keys))
+	end, #b.keys > 1, table.unpack(b.keys)) -- touch buttons for the first four only
 	ContextActionService:SetTitle(name, b.title)
 end

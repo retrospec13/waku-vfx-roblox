@@ -11,6 +11,11 @@ shots and generated audio, including ElevenLabs Sound Effects. The trailer
 is an edited preview, not uninterrupted engine verification. No separate
 third-party ownership or media sublicensing claim is made here.
 
-The six older standalone preview clips are not included. The trailer is the
-single preview for this source kit. Capture tools and production inputs are
-not required to build or author runtime effects and are not included.
+Set 2 adds `media/set-2-trailer.mp4` and `media/set-2-preview.gif`. The trailer
+is a promotional edit with Studio footage and AI-assisted camera shots.
+Its preview use is separate from the reusable source kit.
+
+The standalone ElevenLabs SFX in `audio/` are supplied for reuse under
+[LICENSE-AUDIO.md](LICENSE-AUDIO.md). This explicit audio grant does not apply
+to audio extracted from either trailer. Capture and trailer production tools
+are not included.

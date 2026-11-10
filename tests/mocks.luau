@@ -42,6 +42,7 @@ local Enum=setmetatable({}, {__index=function(t,k)
 end})
 local Random={new=function(seed) return {NextNumber=function(_,a,b) return (a or 0)+((b or 1)-(a or 0))*0.37 end,NextInteger=function(_,a,b) return a end} end}
 local RaycastParams={new=function() return {} end}
+local OverlapParams={new=function() return {} end}
 local methods={}
 local instanceMT={}
 local function newInstance(cls)
@@ -78,6 +79,7 @@ function methods:GetPlayingAnimationTracks() return {} end
 function methods:Raycast(...) return nil end
 local Instance={new=newInstance}
 local Workspace=newInstance('Workspace')
+local workspace=Workspace -- Roblox global alias used by camera-facing Set 2 sprites
 local Lighting=newInstance('Lighting')
 local callbacks={}
 local Heartbeat={Connect=function(_,fn)

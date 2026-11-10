@@ -42,8 +42,9 @@ An R15 NPC can replace `character`. `casters` must be keyed by effect name;
 `caster=npc` at the top level is not a supported SelfTest option. Five checks
 per standard effect cover assets, creation, rainbow, playback and cleanup.
 Cleanup compares original part/decal transparency and anchoring, as well as
-parenting, joints, scheduler and scene grades. A successful run gives 20 checks,
-not the old producer's separate historical 22-check claim. Frozen/slowed clocks
+parenting, joints, scheduler and scene grades. The registry now contains nine effects. Add Set 2 contact/root CFrames to
+`places` and caster entries for ChargeAura, ChargeBeam, GhostDash and
+ImpactFlash when testing character-specific behavior. Frozen/slowed clocks
 are rejected; playback and effect-clock waits have wall-clock guards.
 
 Also try two same-caster posed calls (second must return nil), stop the first,
@@ -53,6 +54,14 @@ cancellation and natural completion. In an isolated custom effect, register a
 cleanup then throw at t=0: play must return nil and leave no model or pose lock.
 The offline regression covers these paths with mocks; perform engine checks
 in your own experience when integrating.
+
+## Set 2 packaging checks
+
+The combined kit passes 25 mock logic regressions, including the natural
+lifecycle of all nine effects. The mocks now provide the Roblox `workspace`
+alias and `OverlapParams` constructor used by Set 2. These are not engine
+render checks. The optional sound helper needs uploaded IDs before playback;
+blank IDs deliberately produce no sound.
 
 ## Limits
 

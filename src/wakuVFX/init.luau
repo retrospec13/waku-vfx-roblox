@@ -7,6 +7,11 @@
 	  waku.play("CrystalBloom", CFrame.new(groundPos))                     -- ice swirl, crystal star bloom, shatter
 	  waku.play("StormLance", CFrame.new(targetPos), { caster = character }) -- stab, three rainbow sky pillars
 	  waku.play("EarthRise", CFrame.lookAt(groundPos, groundPos + facing), { caster = character })
+	  local aura = waku.play("ChargeAura", hrp.CFrame, { caster = character }) -- holds until aura.stop() (3 s if left)
+	  waku.play("HitBurst", CFrame.lookAt(contact, contact + blowDir), { seed = comboIndex }) -- M1 hit, 0.3 s
+	  waku.play("ChargeBeam", hrp.CFrame, { caster = character })       -- gather, then a thick beam along LookVector
+	  waku.play("GhostDash", hrp.CFrame, { caster = character })        -- afterimages + trail; the game moves the caster
+	  waku.play("ImpactFlash", CFrame.lookAt(contact, contact + blowDir), { caster = character }) -- B/W impact frame
 
 	Options vary by effect; see README. Same-caster posed overlap returns nil and records a build error.
 	Everything runs on ONE Heartbeat connection and one effect clock (waku.now). waku.timeScale: nil = real time,
@@ -46,8 +51,13 @@ waku.Effects = {
 	CrystalBloom = require(script.Effects.CrystalBloom) :: Spec,
 	StormLance = require(script.Effects.StormLance) :: Spec,
 	EarthRise = require(script.Effects.EarthRise) :: Spec,
+	ChargeAura = require(script.Effects.ChargeAura) :: Spec,
+	HitBurst = require(script.Effects.HitBurst) :: Spec,
+	ChargeBeam = require(script.Effects.ChargeBeam) :: Spec,
+	GhostDash = require(script.Effects.GhostDash) :: Spec,
+	ImpactFlash = require(script.Effects.ImpactFlash) :: Spec,
 }
-waku.Order = { "PrismCleave", "CrystalBloom", "StormLance", "EarthRise" }
+waku.Order = { "PrismCleave", "CrystalBloom", "StormLance", "EarthRise", "ChargeAura", "HitBurst", "ChargeBeam", "GhostDash", "ImpactFlash" }
 waku.SelfTest = require(script.SelfTest)
 
 export type Options = { rainbow: boolean?, hue: number?, scale: number?, caster: Model?, seed: number?, grade: boolean? }

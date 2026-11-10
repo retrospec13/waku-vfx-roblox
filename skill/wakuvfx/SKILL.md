@@ -14,6 +14,13 @@ for a complete visible effect and exact registration/test steps.
   starting another posed move on that caster. Rejected overlap returns nil.
 - rainbow=false freezes base hue, not spatial rainbow. EarthRise ignores
   scale/rainbow/hue. Do not silently restyle accepted art to change that.
+- ChargeBeam also poses its caster. ChargeAura, GhostDash and ImpactFlash read
+  the caster but never pose or modify it. GhostDash does not move anyone.
+- Kit.plate (flat card at any angle), Kit.sprite (camera-facing card) and
+  Kit.rightTo (beam curve handles) cover most new layers without new parts.
+- Emit each ParticleEmitter once per frame: several Emit(1) calls with the host
+  moved in between all take the last host CFrame. Use spread, or two emitters.
+- spark_streak is drawn sideways: with vpar = true also pass rot = { 90 }.
 - Use ctx.rng for seeded variation. Animate from effect time t, not frame count.
 - Use Kit.part for anchored noncolliding geometry. Keep hot core, rainbow body
   and dark contrast. Register cleanup BEFORE changing anything outside ctx.root.

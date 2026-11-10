@@ -1,0 +1,3058 @@
+<roblox version="4">
+  <Item class="Lighting" referent="0">
+    <Properties>
+      <string name="Name">Lighting</string>
+      <float name="Brightness">1.3</float>
+      <float name="ClockTime">9</float>
+    </Properties>
+    <Item class="BloomEffect" referent="1">
+      <Properties>
+        <string name="Name">Bloom</string>
+        <float name="Intensity">0.7</float>
+        <float name="Size">24</float>
+        <float name="Threshold">1.4</float>
+      </Properties>
+    </Item>
+  </Item>
+  <Item class="ReplicatedStorage" referent="2">
+    <Properties>
+      <string name="Name">ReplicatedStorage</string>
+    </Properties>
+    <Item class="ModuleScript" referent="3">
+      <Properties>
+        <string name="Name">wakuVFX</string>
+        <string name="Source"><![CDATA[--!strict
+--[[
+	wakuVFX: rainbow combat VFX for Roblox (client only).
+
+	  local waku = require(ReplicatedStorage.wakuVFX)
+	  waku.play("PrismCleave", hrp.CFrame, { caster = character })      -- charged dash-slash
+	  waku.play("CrystalBloom", CFrame.new(groundPos))                     -- ice swirl, crystal star bloom, shatter
+	  waku.play("StormLance", CFrame.new(targetPos), { caster = character }) -- stab, three rainbow sky pillars
+	  waku.play("EarthRise", CFrame.lookAt(groundPos, groundPos + facing), { caster = character })
+
+	Options vary by effect; see README. Same-caster posed overlap returns nil and records a build error.
+	Everything runs on ONE Heartbeat connection and one effect clock (waku.now). waku.timeScale: nil = real time,
+	0 = freeze every effect (screenshots only, not fixed-step capture), 0.5 = slow motion. Each effect is a Model under
+	workspace.wakuVFX, destroyed at its life end; a failing step cleans its effect up.
+	Textures: waku.Assets (ids for the PNGs in textures/). A blank id skips that layer and is recorded in waku.Missing.
+]]
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+local Kit = require(script.Kit)
+
+local waku = {}
+waku.Assets = require(script.Assets) :: { [string]: string }
+waku.Missing = Kit.missing
+waku.Errors = {} :: { string }
+waku.timeScale = nil :: number?
+
+-- effect clock -----------------------------------------------------------------------------------------------
+local clockT, clockReal = 0, os.clock()
+function waku.now(): number
+	local real = os.clock()
+	local ts = waku.timeScale
+	clockT += (real - clockReal) * (if ts == nil then 1 else math.max(ts, 0))
+	clockReal = real
+	return clockT
+end
+
+-- registry ---------------------------------------------------------------------------------------------------
+export type Spec = {
+	life: number,
+	required: { string },
+	build: (ctx: Kit.Ctx) -> (number) -> (),
+}
+waku.Effects = {
+	PrismCleave = require(script.Effects.PrismCleave) :: Spec,
+	CrystalBloom = require(script.Effects.CrystalBloom) :: Spec,
+	StormLance = require(script.Effects.StormLance) :: Spec,
+	EarthRise = require(script.Effects.EarthRise) :: Spec,
+}
+waku.Order = { "PrismCleave", "CrystalBloom", "StormLance", "EarthRise" }
+waku.SelfTest = require(script.SelfTest)
+
+export type Options = { rainbow: boolean?, hue: number?, scale: number?, caster: Model?, seed: number?, grade: boolean? }
+export type Handle = { name: string, root: Model, t0: number, life: number, stop: () -> (), alive: () -> boolean }
+
+type Running = { handle: Handle, ctx: Kit.Ctx, update: (number) -> (), ended: boolean }
+local running: { Running } = {}
+local conn: RBXScriptConnection? = nil
+
+local function container(): Folder
+	local f = Workspace:FindFirstChild("wakuVFX")
+	if f and f:IsA("Folder") then
+		return f
+	end
+	local nf = Instance.new("Folder")
+	nf.Name = "wakuVFX"
+	nf.Parent = Workspace
+	return nf
+end
+
+local function finish(r: Running)
+	if r.ended then
+		return
+	end
+	r.ended = true
+	for _, fn in r.ctx.cleanups do
+		local ok, err = pcall(fn :: any)
+		if not ok then
+			local msg = "[wakuVFX] cleanup error in " .. r.handle.name .. ": " .. tostring(err)
+			table.insert(waku.Errors, msg)
+			warn(msg)
+		end
+	end
+	r.handle.root:Destroy()
+end
+
+local function step()
+	local now = waku.now()
+	local ts = waku.timeScale
+	local emitScale = if ts == nil then 1 else math.max(ts, 0)
+	for i = #running, 1, -1 do
+		local r = running[i]
+		if not r.ended then
+			local t = now - r.handle.t0
+			for _, e in r.ctx.emitters do
+				e.TimeScale = emitScale
+			end
+			if t >= r.handle.life then
+				finish(r)
+			else
+				local ok, err = pcall(r.update :: any, t)
+				if not ok then
+					local msg = "[wakuVFX] " .. r.handle.name .. " step error: " .. tostring(err)
+					table.insert(waku.Errors, msg)
+					warn(msg)
+					finish(r)
+				end
+			end
+		end
+		if r.ended then
+			table.remove(running, i)
+		end
+	end
+	if #running == 0 and conn then
+		conn:Disconnect()
+		conn = nil
+	end
+end
+
+function waku.play(name: string, cf: CFrame, opts: Options?): Handle?
+	local spec = waku.Effects[name]
+	if not spec then
+		warn("[wakuVFX] unknown effect " .. tostring(name))
+		return nil
+	end
+	local o: Options = opts or {}
+	local root = Instance.new("Model")
+	root.Name = name
+	local t0 = waku.now()
+	local ctx = Kit.newCtx(root, cf, waku.Assets, {
+		rainbow = if o.rainbow == nil then true else o.rainbow,
+		hue = o.hue or 0,
+		scale = o.scale or 1,
+		caster = o.caster,
+		seed = o.seed or 7,
+		grade = o.grade,
+	})
+	local r: Running
+	local handle: Handle = {
+		name = name,
+		root = root,
+		t0 = t0,
+		life = spec.life,
+		stop = function()
+			if r then
+				finish(r)
+			end
+		end,
+		alive = function()
+			return r ~= nil and not r.ended
+		end,
+	}
+	local ok, upd = pcall(spec.build, ctx)
+	if not ok then
+		local msg = "[wakuVFX] " .. name .. " build error: " .. tostring(upd)
+		table.insert(waku.Errors, msg)
+		warn(msg)
+		for _, fn in ctx.cleanups do
+			pcall(fn)
+		end
+		root:Destroy()
+		return nil
+	end
+	r = { handle = handle, ctx = ctx, update = upd, ended = false }
+	root.Parent = container()
+	local ok0, err0 = pcall(upd, 0)
+	if not ok0 then
+		local msg = "[wakuVFX] " .. name .. " step error: " .. tostring(err0)
+		table.insert(waku.Errors, msg)
+		warn(msg)
+		finish(r)
+		return nil
+	end
+	table.insert(running, r)
+	if not conn then
+		conn = RunService.Heartbeat:Connect(step)
+	end
+	return handle
+end
+
+function waku.activeCount(): number
+	return #running
+end
+
+function waku.connected(): boolean
+	return conn ~= nil
+end
+
+function waku.clear()
+	for _, r in running do
+		finish(r)
+	end
+	table.clear(running)
+	if conn then
+		conn:Disconnect()
+		conn = nil
+	end
+end
+
+-- every texture id the effects use (for ContentProvider:PreloadAsync)
+function waku.preload()
+	local ContentProvider = game:GetService("ContentProvider")
+	local list: { Instance } = {}
+	for _, id in waku.Assets do
+		if id ~= "" then
+			local d = Instance.new("Decal")
+			d.Texture = id
+			table.insert(list, d)
+		end
+	end
+	pcall(function()
+		ContentProvider:PreloadAsync(list)
+	end)
+	for _, d in list do
+		d:Destroy()
+	end
+end
+
+-- shake helper for cameras: EarthRise exposes its own curve; the others a short impact kick
+function waku.shake(name: string, t: number): Vector3
+	local spec = waku.Effects[name] :: any
+	if spec and spec.shake then
+		return spec.shake(t)
+	end
+	return Vector3.zero
+end
+
+return waku
+]]></string>
+      </Properties>
+      <Item class="ModuleScript" referent="4">
+        <Properties>
+          <string name="Name">Assets</string>
+          <string name="Source"><![CDATA[--!strict
+-- Texture ids for the PNGs in textures/ (generated by tools/gen_textures.py). These were uploaded for the wakuVFX
+-- release; if one will not load in your experience, upload that PNG yourself and paste its "rbxassetid://<id>".
+-- A blank id skips that layer and is counted in wakuVFX.Missing; the SelfTest fails on it.
+return {
+	glow_soft = "rbxassetid://108086570872537",
+	spark_streak = "rbxassetid://134459142509963",
+	spark_glint = "rbxassetid://120096211228402",
+	shock_ring = "rbxassetid://127393806720166",
+	ground_crack = "rbxassetid://131000614993035",
+	frost_ring = "rbxassetid://130078436122278",
+	frost_ground = "rbxassetid://122141137658420",
+	slash_body = "rbxassetid://71623767325279",
+	slash_rim = "rbxassetid://120929258981364",
+	bolt_glow = "rbxassetid://72655402834181",
+	smoke_puff = "rbxassetid://105244598738114",
+	ice_shard = "rbxassetid://90733422362747",
+	ground_disc = "rbxassetid://98035594275693",
+	frost_crack = "rbxassetid://75329703022442",
+	slash_edge = "rbxassetid://76962741210489",
+	slash_ink = "rbxassetid://92479750408080",
+}
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="5">
+        <Properties>
+          <string name="Name">CasterState</string>
+          <string name="Source"><![CDATA[--!strict
+-- One pose owner per original caster, shared by Pose and EarthRise.
+-- A second posed effect fails cleanly instead of snapshotting an already hidden rig.
+local Players = game:GetService("Players")
+local CasterState = {}
+local owners: { [Model]: any } = {}
+
+function CasterState.clone(ctx: any, caster: Model): Model
+	if owners[caster] then
+		error("caster already has an active pose; stop the previous handle first")
+	end
+	local token = {}
+	owners[caster] = token
+	local parent = caster.Parent
+	local archivable = caster.Archivable
+	local isPlayer = Players:GetPlayerFromCharacter(caster) ~= nil
+	local hidden: { [Instance]: number } = {}
+	local hrp = caster:FindFirstChild("HumanoidRootPart")
+	local root: BasePart? = if hrp and hrp:IsA("BasePart") then hrp else nil
+	local anchored = if root then root.Anchored else false
+	local changedParent = false
+	local changedAnchor = false
+	-- Register restoration before cloning or changing any external state.
+	table.insert(ctx.cleanups, function()
+		if owners[caster] ~= token then
+			return
+		end
+		owners[caster] = nil
+		caster.Archivable = archivable
+		if changedParent then
+			caster.Parent = parent
+		end
+		for d, tr in hidden do
+			if d.Parent then
+				(d :: any).Transparency = tr
+			end
+		end
+		if root and changedAnchor then
+			root.Anchored = anchored
+		end
+	end)
+	caster.Archivable = true
+	local clone = caster:Clone()
+	caster.Archivable = archivable
+	assert(clone, "caster could not be cloned")
+	clone.Parent = ctx.root
+	if isPlayer then
+		for _, d in caster:GetDescendants() do
+			if d:IsA("BasePart") or d:IsA("Decal") then
+				local visual = d :: any
+				hidden[d] = visual.Transparency
+				visual.Transparency = 1
+			end
+		end
+		if root then
+			changedAnchor = true
+			root.Anchored = true
+		end
+	else
+		changedParent = true
+		caster.Parent = nil
+	end
+	return clone
+end
+
+return CasterState
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="Folder" referent="6">
+        <Properties>
+          <string name="Name">Effects</string>
+        </Properties>
+        <Item class="ModuleScript" referent="7">
+          <Properties>
+            <string name="Name">CrystalBloom</string>
+            <string name="Source"><![CDATA[--!strict
+--[[ CrystalBloom: an icy swirl gathers crystals into a star bloom on a frost dome, which whites out and shatters.
+	0.00-1.00  MIST SWIRL: three pale rainbow mist rings spin round the target and tighten, mist streams off them;
+	           ten small double-pointed crystal shards ride the spiral inward and vanish into the centre
+	0.85-1.75  BLOOM: 12 long crystal blades and 6 short ones fan up and out of a glowing core like a star or
+	           crown, each a different rainbow hue round the wheel, with one white outline. A frost ring rushes
+	           out, frost cracks spread, and a white frost dome swells underneath.
+	1.75       WHITE-OUT: the dome flares, the scene grade pops to white
+	1.85       SHATTER: blades and dome burst into tumbling shards and a radial storm of rainbow ice streaks,
+	           then glitter and a lingering frost patch
+	cf = the target point on the ground. opts.grade = false skips the scene grade. Life 2.6 s. ]]
+local Workspace = game:GetService("Workspace")
+local Kit = require(script.Parent.Parent.Kit)
+
+local CrystalBloom = {}
+CrystalBloom.life = 2.6
+CrystalBloom.required = { "slash_body", "smoke_puff", "frost_ring", "frost_crack", "glow_soft", "ice_shard", "spark_glint", "spark_streak" }
+
+local NSEG = 12
+local T_BLOOM, T_WHITE, T_SHATTER = 0.85, 1.75, 1.85
+
+type PartOff = { p: BasePart, off: CFrame }
+type Blade = { parts: { PartOff }, dir: CFrame, L: number, w: number, t0: number, hue: number,
+	shards: { { p: BasePart, p0: Vector3, v: Vector3, w: Vector3, size: Vector3 } } }
+
+function CrystalBloom.build(ctx: Kit.Ctx): (number) -> ()
+	local S = ctx.opts.scale
+	local rng = ctx.rng
+	local params = RaycastParams.new()
+	params.FilterDescendantsInstances = { ctx.root }
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local hit = Workspace:Raycast(ctx.cf.Position + Vector3.new(0, 6, 0), Vector3.new(0, -16, 0), params)
+	local gy = if hit then hit.Position.Y else ctx.cf.Position.Y
+	local c = Vector3.new(ctx.cf.X, gy, ctx.cf.Z)
+	local P = c + Vector3.yAxis * 3.2 * S -- bloom centre
+	local once = Kit.once()
+	local grade = Kit.grade(ctx)
+
+	local crystals = Instance.new("Model")
+	crystals.Name = "Crystals"
+	crystals.Parent = ctx.root
+	local hl = Instance.new("Highlight")
+	hl.FillTransparency = 1
+	hl.OutlineColor = Color3.fromRGB(240, 250, 255)
+	hl.OutlineTransparency = 0.25
+	hl.DepthMode = Enum.HighlightDepthMode.Occluded
+	hl.Adornee = crystals
+	hl.Parent = crystals
+
+	-- a double-pointed crystal along +Y from its base (0) to its far tip (L): glass body, gabled tips, Neon core
+	local function crystal(parent: Instance, L: number, w: number): { PartOff }
+		local parts: { PartOff } = {}
+		local tipH = math.min(L * 0.28, w * 1.8)
+		local bodyH = L - tipH * 1.5
+		local body = Kit.part(ctx, parent, "Body", Vector3.new(w, bodyH, w), Color3.new(1, 1, 1), Enum.Material.Glass)
+		body.Transparency = 0.15
+		body.Reflectance = 0.2
+		table.insert(parts, { p = body :: BasePart, off = CFrame.new(0, tipH * 0.5 + bodyH / 2, 0) })
+		for _, e in { { tipH * 0.5 + bodyH, tipH, 0 }, { tipH * 0.5, tipH * 0.5, math.pi } } do
+			local y, h, flipX = e[1], e[2], e[3]
+			for _, rot in { 0, math.pi / 2 } do
+				for _, flip in { 0, math.pi } do
+					local wd = Kit.wedge(parent, "Tip", Vector3.new(w, h, w / 2), Color3.new(1, 1, 1), Enum.Material.Glass)
+					wd.Transparency = 0.15
+					wd.Reflectance = 0.2
+					local off = CFrame.new(0, y, 0) * CFrame.Angles(flipX, 0, 0) * CFrame.new(0, h / 2, 0)
+						* CFrame.Angles(0, rot + flip, 0) * CFrame.new(0, 0, -w / 4)
+					table.insert(parts, { p = wd, off = off })
+				end
+			end
+		end
+		local core = Kit.part(ctx, parent, "Core", Vector3.new(w * 0.3, bodyH * 0.9, w * 0.3), Color3.new(1, 1, 1), Enum.Material.Neon)
+		core.Transparency = 0.25
+		table.insert(parts, { p = core :: BasePart, off = CFrame.new(0, tipH * 0.5 + bodyH / 2, 0) })
+		return parts
+	end
+
+	-- bloom blades: a star/crown fanning up and out
+	local blades: { Blade } = {}
+	local function addBlade(az: number, el: number, L: number, w: number, t0: number, hue: number)
+		local d = Vector3.new(math.cos(az) * math.cos(el), math.sin(el), math.sin(az) * math.cos(el))
+		local dir = CFrame.lookAt(P, P + d) * CFrame.Angles(-math.pi / 2, 0, 0) * CFrame.Angles(0, rng:NextNumber(0, math.pi), 0)
+		local m = Instance.new("Model")
+		m.Name = "Blade"
+		m.Parent = crystals
+		local shards = {}
+		for k = 1, 3 do
+			local sz = Vector3.new(w * rng:NextNumber(0.5, 0.8), L * rng:NextNumber(0.2, 0.32), w * rng:NextNumber(0.35, 0.55))
+			local sp = Kit.wedge(ctx.root, "Shard", sz, Color3.new(1, 1, 1), Enum.Material.Glass)
+			sp.Transparency = 0.2
+			local p0 = P + d * L * (k - 0.5) / 3
+			table.insert(shards, { p = sp, p0 = p0, size = sz,
+				v = (d * rng:NextNumber(14, 26) + Vector3.new(rng:NextNumber(-4, 4), rng:NextNumber(2, 9), rng:NextNumber(-4, 4))) * S,
+				w = Vector3.new(rng:NextNumber(-10, 10), rng:NextNumber(-10, 10), rng:NextNumber(-10, 10)) })
+		end
+		table.insert(blades, { parts = crystal(m, L, w), dir = dir, L = L, w = w, t0 = t0, hue = hue, shards = shards })
+	end
+	for k = 1, 12 do
+		local az = k / 12 * math.pi * 2 + rng:NextNumber(-0.1, 0.1)
+		addBlade(az, math.rad(rng:NextNumber(12, 58)), rng:NextNumber(6, 9) * S, rng:NextNumber(0.95, 1.3) * S,
+			T_BLOOM + (k % 4) * 0.03 + k * 0.006, k / 12)
+	end
+	for k = 1, 6 do
+		local az = (k + 0.5) / 6 * math.pi * 2
+		addBlade(az, math.rad(rng:NextNumber(65, 85)), rng:NextNumber(3.5, 5) * S, 0.8 * S, T_BLOOM + 0.1 + k * 0.012, k / 6 + 0.04)
+	end
+
+	-- swirl riders
+	type Rider = { parts: { PartOff }, a0: number, h: number, spin: Vector3, hue: number }
+	local riders: { Rider } = {}
+	for k = 1, 10 do
+		local m = Instance.new("Model")
+		m.Name = "Rider"
+		m.Parent = crystals
+		table.insert(riders, { parts = crystal(m, 1.8 * S, 0.5 * S), a0 = k / 10 * math.pi * 2, h = rng:NextNumber(0.6, 3.4) * S,
+			spin = Vector3.new(rng:NextNumber(-8, 8), rng:NextNumber(-8, 8), rng:NextNumber(-8, 8)), hue = k / 10 })
+	end
+
+	-- mist rings (flat arcs in the horizontal plane)
+	type Arc = { atts: { Attachment }, beams: { Beam } }
+	local mistRings: { Arc } = {}
+	for i = 1, 3 do
+		local atts, beams = {}, {}
+		for k = 0, NSEG do
+			atts[k + 1] = Kit.att(ctx)
+		end
+		for k = 1, NSEG do
+			local b = Kit.beam(ctx, atts[k], atts[k + 1], "slash_body", 0)
+			b.Name = "Mist" .. i
+			b.FaceCamera = false
+			b.Segments = 8
+			b.LightEmission = 0.4
+			b.Brightness = 1.3
+			beams[k] = b
+		end
+		table.insert(mistRings, { atts = atts, beams = beams })
+	end
+
+	-- core, dome
+	local core = Kit.part(ctx, ctx.root, "BloomCore", Vector3.one, Color3.new(1, 1, 1), Enum.Material.Neon)
+	core.Shape = Enum.PartType.Ball
+	local dome = Kit.part(ctx, ctx.root, "Dome", Vector3.one, Color3.new(1, 1, 1), Enum.Material.Glass)
+	dome.Shape = Enum.PartType.Ball
+	dome.Reflectance = 0.25
+	local domeGlow = Kit.part(ctx, ctx.root, "DomeGlow", Vector3.one, Color3.new(1, 1, 1), Enum.Material.Neon)
+	domeGlow.Shape = Enum.PartType.Ball
+
+	local mist = Kit.burst(ctx, "Mist", { tex = "smoke_puff", life = { 0.6, 1.0 }, size = { { 0, 2 }, { 1, 5 } },
+		transp = { { 0, 1 }, { 0.2, 0.6 }, { 0.7, 0.75 }, { 1, 1 } }, speed = { 6, 11 }, spread = 15, drag = 2, rot = { 0, 360 },
+		rotSpeed = { -60, 60 }, le = 0.3, bright = 1.2 })
+	local frostRing = Kit.flat(ctx, "FrostRing", { tex = "frost_ring", life = 0.55, size = { { 0, 2 }, { 0.12, 12 }, { 0.3, 18 }, { 0.6, 21 }, { 1, 22 } },
+		transp = { { 0, 0 }, { 0.45, 0.2 }, { 1, 1 } }, rot = 30, spin = 25, bright = 2, z = 1 })
+	local crackDark = Kit.flat(ctx, "FrostDark", { tex = "frost_crack", life = 1.6, size = { { 0, 3 }, { 0.15, 14 }, { 1, 15 } },
+		transp = { { 0, 0.1 }, { 0.8, 0.2 }, { 1, 1 } }, rot = 15, le = 0, z = -1 })
+	local crackHot = Kit.flat(ctx, "FrostHot", { tex = "frost_crack", life = 1.1, size = { { 0, 3 }, { 0.2, 14 }, { 1, 15 } },
+		transp = { { 0, 0 }, { 0.4, 0.25 }, { 1, 1 } }, rot = 15, bright = 2.4 })
+	local whiteout = Kit.burst(ctx, "WhiteOut", { tex = "glow_soft", life = { 0.16 }, size = { { 0, 16 }, { 0.3, 36 }, { 1, 40 } },
+		transp = { { 0, 0 }, { 0.5, 0.35 }, { 1, 1 } }, bright = 3, zoff = 6 })
+	local storm = Kit.burst(ctx, "ShardStorm", { tex = "ice_shard", life = { 0.35, 0.65 }, size = { { 0, 1.1 }, { 1, 0.25 } },
+		speed = { 40, 70 }, spread = 0, drag = 2, vpar = true, le = 0.6, bright = 1.6 })
+	local streaks = Kit.burst(ctx, "Streaks", { tex = "spark_streak", life = { 0.25, 0.5 }, size = { { 0, 1.0 }, { 1, 0 } },
+		speed = { 50, 90 }, drag = 3, vpar = true, bright = 5 })
+	local glitter = Kit.burst(ctx, "Glitter", { tex = "spark_glint", life = { 0.2, 0.32 }, size = { { 0, 0 }, { 0.2, 2.4 }, { 1, 0 } },
+		speed = { 0.5, 2 }, spread = 180, bright = 6, zoff = 2 })
+	local lightHost = Kit.part(ctx, ctx.root, "LightHost", Vector3.one * 0.2, Color3.new(), Enum.Material.SmoothPlastic)
+	lightHost.Transparency = 1
+	lightHost.CFrame = CFrame.new(P + Vector3.yAxis * 2 * S)
+	local light = Kit.light(ctx, lightHost, 26 * S)
+
+	local function place(parts: { PartOff }, cf: CFrame?, color: Color3)
+		for _, e in parts do
+			if cf then
+				e.p.CFrame = cf * e.off
+				e.p.Color = if e.p.Name == "Core" then Color3.new(1, 1, 1):Lerp(color, 0.25) else color
+			else
+				e.p.CFrame = Kit.HIDE
+			end
+		end
+	end
+
+	return function(t: number)
+		local h0 = Kit.hue(ctx, t, 0)
+		-- grade: cool tint while it builds, white pop at the white-out
+		if grade then
+			local cool = Kit.ramp(t, 0.1, 0.6) * (1 - Kit.ramp(t, 2.0, 2.5))
+			local pop = math.max(0, 1 - math.abs(t - T_WHITE - 0.05) / 0.12)
+			grade.TintColor = Color3.new(1, 1, 1):Lerp(Color3.fromRGB(200, 225, 255), cool)
+			grade.Brightness = -0.08 * cool + 0.6 * pop
+			grade.Saturation = 0.1 * cool - 0.4 * pop
+		end
+		-- mist rings
+		for i, a in ipairs(mistRings) do
+			local on = Kit.ramp(t, 0.0 + i * 0.05, 0.2 + i * 0.05) * (1 - Kit.ramp(t, 0.8, 1.15))
+			if on <= 0 then
+				for _, b in a.beams do
+					b.Enabled = false
+				end
+				continue
+			end
+			local R = (9 - 4.5 * Kit.easeIn(Kit.ramp(t, 0, 1.0)) - i * 0.6) * S
+			local y = (0.3 + (i - 1) * 1.0) * S
+			local th0 = t * (5 + i) * (if i == 2 then -1 else 1)
+			local span = math.rad(250) * (if i == 2 then -1 else 1)
+			local dir = if span >= 0 then 1 else -1
+			local thick = (1.6 + 0.4 * i) * S
+			for k = 0, NSEG do
+				local f = k / NSEG
+				local w = thick * (0.05 + 0.95 * math.sin(math.pi * f) ^ 0.8)
+				local th = th0 + span * f
+				local radial = Vector3.new(math.cos(th), 0, math.sin(th))
+				local tang = Vector3.new(-math.sin(th), 0, math.cos(th)) * dir
+				a.atts[k + 1].CFrame = CFrame.fromMatrix(c + Vector3.yAxis * y + radial * (R - w / 2), tang, radial)
+				if k > 0 then
+					a.beams[k].Width1 = w
+				end
+				if k < NSEG then
+					a.beams[k + 1].Width0 = w
+				end
+			end
+			local kc = 4 / 3 * math.tan(math.abs(span) / NSEG / 4) * R
+			for k, b in a.beams do
+				local fa = (k - 1) / NSEG
+				b.Enabled = true
+				b.CurveSize0, b.CurveSize1 = kc, kc
+				b.Color = Kit.hueSeq(h0 + i * 0.3 + fa * 0.5, 0.5 / NSEG, 0.4, 1, 2)
+				b.Transparency = NumberSequence.new(1 - on * 0.75 * Kit.smooth(fa * 3))
+			end
+		end
+		for sl = 0, 8 do
+			if once("mist" .. sl, t, 0.05 + sl * 0.1) then
+				for k = 1, 3 do
+					local th = t * 6 + k * 2.1
+					local R = (8 - 4 * Kit.ramp(t, 0, 1)) * S
+					local p = c + Vector3.new(math.cos(th) * R, 0.8 * S, math.sin(th) * R)
+					local tang = Vector3.new(-math.sin(th), 0.05, math.cos(th))
+					Kit.spray(ctx, mist, p, 1, ColorSequence.new(Kit.col(h0 + k * 0.33, 0.25, 1)), "point", 0, 0, tang)
+				end
+			end
+		end
+		-- riders spiral inward and vanish into the centre
+		for _, r in riders do
+			local k = Kit.ramp(t, 0.15, T_BLOOM)
+			if t >= 0.15 and t < T_BLOOM then
+				local R = (9.5 * (1 - Kit.easeIn(k)) + 0.4) * S
+				local th = r.a0 + t * 7
+				local p = c + Vector3.new(math.cos(th) * R, r.h + (P.Y - c.Y - r.h) * Kit.easeIn(k), math.sin(th) * R)
+				local cf = CFrame.new(p) * CFrame.Angles(r.spin.X * t, r.spin.Y * t, r.spin.Z * t) * CFrame.new(0, -0.9 * S, 0)
+				place(r.parts, cf, Kit.col(h0 + r.hue, 0.6, 1))
+			else
+				place(r.parts, nil, Color3.new())
+			end
+		end
+		-- glowing core
+		if t >= 0.5 and t < T_SHATTER then
+			local g = Kit.ramp(t, 0.5, T_BLOOM)
+			core.Size = Vector3.one * (0.5 + 2.2 * g + 0.4 * math.sin(t * 30) * g) * S
+			core.CFrame = CFrame.new(P)
+			core.Transparency = 0.15
+			core.Color = Kit.hot(h0)
+		else
+			core.CFrame = Kit.HIDE
+		end
+		-- blades slide out of the core (ease-out-back), hold, shatter
+		for _, b in blades do
+			local g = Kit.easeOutBack((t - b.t0) / 0.16)
+			if t >= b.t0 and t < T_SHATTER then
+				local col = Kit.col(h0 + b.hue, 0.6, 1)
+				place(b.parts, b.dir * CFrame.new(0, -b.L * (1 - g), 0), col)
+			else
+				place(b.parts, nil, Color3.new())
+			end
+			for _, sh in b.shards do
+				local ts = t - T_SHATTER
+				if ts < 0 then
+					sh.p.CFrame = Kit.HIDE
+				else
+					local pos = sh.p0 + sh.v * ts + Vector3.new(0, -50, 0) * ts * ts * 0.5
+					if pos.Y < gy + 0.2 then
+						pos = Vector3.new(pos.X, gy + 0.2, pos.Z)
+					end
+					sh.p.Size = sh.size * (1 - 0.7 * Kit.ramp(ts, 0.25, 0.65))
+					sh.p.CFrame = CFrame.new(pos) * CFrame.Angles(sh.w.X * ts, sh.w.Y * ts, sh.w.Z * ts)
+					sh.p.Color = Kit.col(h0 + b.hue, 0.55, 1)
+					sh.p.Transparency = 0.2 + 0.8 * Kit.ramp(ts, 0.35, 0.7)
+				end
+			end
+		end
+		-- frost dome swells under the bloom and flares at the white-out
+		if t >= T_BLOOM and t < T_SHATTER then
+			local g = Kit.easeOut(Kit.ramp(t, T_BLOOM, T_WHITE))
+			local flare = Kit.ramp(t, T_WHITE - 0.1, T_SHATTER)
+			local D = (2.5 + 6.5 * g + 3.5 * flare) * S
+			dome.Size = Vector3.one * D
+			dome.CFrame = CFrame.new(c)
+			dome.Transparency = 0.82 - 0.4 * flare
+			dome.Color = Color3.new(1, 1, 1):Lerp(Kit.col(h0 + 0.55, 0.35, 1), 0.5)
+			domeGlow.Size = Vector3.one * D * 0.8
+			domeGlow.CFrame = CFrame.new(c)
+			domeGlow.Transparency = 0.9 - 0.55 * flare
+			domeGlow.Color = Kit.hot(h0 + 0.55)
+		else
+			dome.CFrame = Kit.HIDE
+			domeGlow.CFrame = Kit.HIDE
+		end
+		if once("frost", t, T_BLOOM) then
+			frostRing.fire(T_BLOOM, c + Vector3.yAxis * 0.14, ColorSequence.new(Kit.col(h0 + 0.5, 0.35, 1)))
+			Kit.spray(ctx, glitter, P, 6, ColorSequence.new(Kit.hot(h0)), "sphere", 4)
+		end
+		if once("cracks", t, T_BLOOM + 0.05) then
+			crackDark.fire(T_BLOOM + 0.05, c + Vector3.yAxis * 0.06, ColorSequence.new(Kit.ink(h0 + 0.5)))
+			crackHot.fire(T_BLOOM + 0.05, c + Vector3.yAxis * 0.1, Kit.hueSeq(h0 + 0.5, 0.4, 0.3, 1, 3))
+		end
+		frostRing.update(t)
+		crackDark.update(t)
+		crackHot.update(t)
+		if once("white", t, T_WHITE) then
+			Kit.spray(ctx, whiteout, P, 1, ColorSequence.new(Kit.hot(h0)), "point")
+		end
+		if once("shatter", t, T_SHATTER) then
+			for k = 1, 6 do
+				Kit.spray(ctx, storm, P, 10, ColorSequence.new(Kit.col(h0 + k / 6, 0.8, 1)), "sphere")
+			end
+			Kit.spray(ctx, streaks, P, 24, Kit.hueSeq(h0, 1, 0.75, 1, 6), "sphere")
+		end
+		if once("glit2", t, T_SHATTER + 0.15) then
+			Kit.spray(ctx, glitter, P, 8, ColorSequence.new(Kit.hot(h0 + 0.3)), "sphere", 6)
+		end
+		light.Brightness = 2 * Kit.ramp(t, 0.5, T_BLOOM) * (if t < T_SHATTER then 1 else 0) + 3 * Kit.ramp(t, T_BLOOM, T_WHITE) * (if t < T_SHATTER then 1 else 0)
+			+ (if t >= T_WHITE then 8 * math.exp(-(t - T_WHITE) * 6) else 0)
+		light.Color = Kit.col(h0 + 0.55, 0.35, 1)
+	end
+end
+
+function CrystalBloom.shake(t: number): Vector3
+	local a = 0.08 * (if t > 0.85 and t < 1.75 then 1 else 0) + (if t >= 1.85 then 0.7 * math.exp(-(t - 1.85) * 8) else 0)
+	return Vector3.new(math.sin(t * 90) * a, math.sin(t * 70 + 1) * a * 0.7, 0)
+end
+
+return CrystalBloom
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="8">
+          <Properties>
+            <string name="Name">EarthRise</string>
+            <string name="Source"><![CDATA[--!strict
+--[[ EarthRise: alchemy-style earth move for wakuVFX. Clap, palms slam the ground, a glyph circle draws itself,
+	and a wave of studded rainbow voxel pillars erupts along the facing direction, holds, then crumbles cube by cube.
+	Beats (effect time, seconds):
+	  0.00-0.30  wind-up, arms sweep wide, then CLAP (hot flash + rainbow sparks at the hands)
+	  0.30-0.62  drop into a crouch, palms slam the ground
+	  0.62       slam: shock ring, crack, dust, glyph circle (two rings, hexagram, ticks) draws by angle, rainbow arcs
+	  0.66-1.40  8 main pillars + 7 pairs of flanking walls rise as rigid voxel columns (ease-out-back), 2x2 studs on
+	             every column top, white-hot flash on emergence, then one hue per pillar along the wave
+	  1.40-3.00  hold: hue drifts, arcs fade, glyph fades out
+	  3.00-4.70  crumble top-down, each voxel 0.05 s after the one above: drift, spin, shrink, fade
+	  4.90       everything destroyed, caster pose reset
+	cf = ground point under the caster, LookVector = direction of the wave. opts.caster = R15 model to pose
+	(procedural pose on a local clone, no animation asset). Always rainbow (opts.rainbow/hue are ignored).
+]]
+local CasterState = require(script.Parent.Parent.CasterState)
+local Kit = require(script.Parent.Parent.Kit)
+
+local EarthRise = {}
+EarthRise.life = 4.9
+EarthRise.currentT = nil :: number?
+
+local TAU = math.pi * 2
+local function clamp01(x: number): number
+	return math.clamp(x, 0, 1)
+end
+local function smooth(x: number): number
+	x = clamp01(x)
+	return x * x * (3 - 2 * x)
+end
+local function easeOutBack(x: number): number
+	x = clamp01(x)
+	local c1, c3 = 2.2, 3.2
+	return 1 + c3 * (x - 1) ^ 3 + c1 * (x - 1) ^ 2
+end
+local function rainbow(h: number, s: number?, v: number?): Color3
+	return Color3.fromHSV(h % 1, s or 0.9, v or 1)
+end
+
+-------------------------------------------------------------------------------
+-- caster pose (R15 Motor6D.Transform keyframes)
+-------------------------------------------------------------------------------
+local R = math.rad
+local function A(x: number, y: number, z: number): CFrame
+	return CFrame.Angles(R(x), R(y), R(z))
+end
+-- yaw after pitch: raise the arm forward first, then swing it inward
+local function arm(pitch: number, yaw: number, roll: number): CFrame
+	return CFrame.Angles(0, R(yaw), 0) * CFrame.Angles(R(pitch), 0, 0) * CFrame.Angles(0, 0, R(roll))
+end
+local I = CFrame.identity
+local KEYS: { { t: number, p: { [string]: CFrame } } } = {
+	{ t = 0.0, p = {} },
+	{ t = 0.17, p = { -- wind-up: arms flung wide and high, chest open
+		Waist = A(12, 0, 0), Neck = A(10, 0, 0),
+		RightShoulder = arm(0, 0, 115), LeftShoulder = arm(0, 0, -115),
+		RightElbow = A(20, 0, 0), LeftElbow = A(20, 0, 0) } },
+	{ t = 0.29, p = { -- CLAP in front of the chest
+		Waist = A(-6, 0, 0), Neck = A(-4, 0, 0),
+		RightShoulder = arm(82, 38, 0), LeftShoulder = arm(82, -38, 0),
+		RightElbow = A(28, 0, 0), LeftElbow = A(28, 0, 0) } },
+	{ t = 0.42, p = { -- hold the clap, sink a little
+		Root = CFrame.new(0, -0.25, 0), Waist = A(-8, 0, 0), Neck = A(-6, 0, 0),
+		RightShoulder = arm(85, 40, 0), LeftShoulder = arm(85, -40, 0),
+		RightElbow = A(30, 0, 0), LeftElbow = A(30, 0, 0),
+		RightHip = A(14, 0, 0), LeftHip = A(14, 0, 0), RightKnee = A(-22, 0, 0), LeftKnee = A(-22, 0, 0) } },
+	{ t = 0.62, p = { -- SLAM: deep crouch, palms flat on the ground in front
+		Root = CFrame.new(0, -1.45, 0) * A(-28, 0, 0), Waist = A(-22, 0, 0), Neck = A(18, 0, 0),
+		RightShoulder = arm(62, 8, 0), LeftShoulder = arm(62, -8, 0),
+		RightElbow = A(6, 0, 0), LeftElbow = A(6, 0, 0),
+		RightWrist = A(-55, 0, 0), LeftWrist = A(-55, 0, 0),
+		RightHip = A(96, 0, 0), LeftHip = A(70, 0, -8), RightKnee = A(-110, 0, 0), LeftKnee = A(-95, 0, 0) } },
+	{ t = 2.75, p = "SAME" :: any },
+	{ t = 3.35, p = { -- rise, one arm thrown out toward the wall of stone
+		Waist = A(0, -10, 0), Neck = A(0, -12, 0),
+		RightShoulder = arm(70, -20, 0), RightElbow = A(5, 0, 0) } },
+	{ t = 4.9, p = {} },
+}
+KEYS[6].p = KEYS[5].p
+local JOINTS = { "Root", "Waist", "Neck", "RightShoulder", "LeftShoulder", "RightElbow", "LeftElbow", "RightWrist",
+	"LeftWrist", "RightHip", "LeftHip", "RightKnee", "LeftKnee" }
+
+local function poseAt(t: number): { [string]: CFrame }
+	local out = {}
+	for i = 1, #KEYS - 1 do
+		local a, b = KEYS[i], KEYS[i + 1]
+		if t <= b.t or i == #KEYS - 1 then
+			local u = smooth((t - a.t) / (b.t - a.t))
+			for _, j in JOINTS do
+				out[j] = (a.p[j] or I):Lerp(b.p[j] or I, u)
+			end
+			return out
+		end
+	end
+	return out
+end
+
+-------------------------------------------------------------------------------
+-- builders
+-------------------------------------------------------------------------------
+local function part(parent: Instance, name: string, size: Vector3, color: Color3, mat: Enum.Material): Part
+	local p = Instance.new("Part")
+	p.Name = name
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanQuery = false
+	p.CanTouch = false
+	p.CastShadow = false
+	p.Size = size
+	p.Color = color
+	p.Material = mat
+	p.TopSurface = Enum.SurfaceType.Smooth
+	p.BottomSurface = Enum.SurfaceType.Smooth
+	p.Parent = parent
+	return p
+end
+
+local HIDE = CFrame.new(0, -500, 0)
+
+type Block = { p: Part, j: number, hc: number, size: Vector3, off: CFrame, studs: { { p: Part, off: CFrame } }, spin: Vector3, drift: Vector3 }
+type Pillar = { model: Model, base: CFrame, ts: number, tc: number, h: number, height: number, blocks: { Block },
+	k: number, main: boolean, glow: PointLight?, fired: boolean, crumbleFired: boolean, debris: { { p: Part, v: Vector3, w: Vector3, p0: Vector3 } } }
+
+
+EarthRise.required = { "spark_streak", "spark_glint", "glow_soft", "shock_ring", "ground_crack" }
+
+function EarthRise.build(ctx: Kit.Ctx): (number) -> ()
+	local caster: Model? = ctx.opts.caster
+	local base = ctx.cf
+	local rng = Random.new(ctx.opts.seed)
+	local root = ctx.root
+	local function T(key: string): string
+		return Kit.tex(ctx, key)
+	end
+
+	local fwd = base.LookVector
+	local right = base.RightVector
+	local ground = base.Position
+	local center = ground + fwd * 2.4 + Vector3.new(0, 0.06, 0)
+
+	-- emitter host (one invisible part, moved before each Emit)
+	local host = part(root, "EmitHost", Vector3.one, Color3.new(), Enum.Material.SmoothPlastic)
+	host.Transparency = 1
+	local att = Instance.new("Attachment")
+	att.Parent = host
+	local emitters = ctx.emitters
+	local function emitter(name: string, texture: string): ParticleEmitter
+		local e = Instance.new("ParticleEmitter")
+		e.Name = name
+		e.Texture = texture
+		e.Enabled = false
+		e.Parent = att
+		table.insert(emitters, e)
+		return e
+	end
+	local rainbowSeq = ColorSequence.new({
+		ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 70, 70)), ColorSequenceKeypoint.new(0.2, Color3.fromRGB(255, 200, 60)),
+		ColorSequenceKeypoint.new(0.4, Color3.fromRGB(90, 255, 110)), ColorSequenceKeypoint.new(0.6, Color3.fromRGB(70, 200, 255)),
+		ColorSequenceKeypoint.new(0.8, Color3.fromRGB(150, 90, 255)), ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 80, 210)) })
+	local sparks = emitter("Sparks", T("spark_streak"))
+	sparks.Color = rainbowSeq
+	sparks.LightEmission = 1
+	sparks.LightInfluence = 0
+	sparks.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.9), NumberSequenceKeypoint.new(1, 0) })
+	sparks.Transparency = NumberSequence.new(0)
+	sparks.Lifetime = NumberRange.new(0.25, 0.6)
+	sparks.Speed = NumberRange.new(22, 46)
+	sparks.SpreadAngle = Vector2.new(180, 180)
+	sparks.Acceleration = Vector3.new(0, -40, 0)
+	sparks.Drag = 3
+	sparks.Orientation = Enum.ParticleOrientation.VelocityParallel
+	local dust = emitter("Dust", T("glow_soft"))
+	dust.Color = ColorSequence.new(Color3.fromRGB(120, 108, 100), Color3.fromRGB(70, 64, 62))
+	dust.LightEmission = 0
+	dust.LightInfluence = 0.6
+	dust.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 2.2), NumberSequenceKeypoint.new(1, 6.5) })
+	dust.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.35), NumberSequenceKeypoint.new(1, 1) })
+	dust.Lifetime = NumberRange.new(0.8, 1.5)
+	dust.Speed = NumberRange.new(5, 14)
+	dust.SpreadAngle = Vector2.new(80, 80)
+	dust.Acceleration = Vector3.new(0, 2, 0)
+	dust.Drag = 3.5
+	dust.Rotation = NumberRange.new(0, 360)
+	dust.RotSpeed = NumberRange.new(-40, 40)
+	local glints = emitter("Glints", T("spark_glint"))
+	glints.Color = rainbowSeq
+	glints.LightEmission = 1
+	glints.LightInfluence = 0
+	glints.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.6), NumberSequenceKeypoint.new(1, 0) })
+	glints.Lifetime = NumberRange.new(0.5, 1.1)
+	glints.Speed = NumberRange.new(6, 18)
+	glints.SpreadAngle = Vector2.new(60, 60)
+	glints.Acceleration = Vector3.new(0, -12, 0)
+	glints.Rotation = NumberRange.new(0, 360)
+	glints.RotSpeed = NumberRange.new(-300, 300)
+	local function emitAt(e: ParticleEmitter, pos: Vector3, n: number, up: Vector3?)
+		host.CFrame = CFrame.lookAt(pos, pos + (up or Vector3.yAxis)) * CFrame.Angles(-math.pi / 2, 0, 0)
+		e:Emit(n)
+	end
+
+	-- clap flash + slam shock ring + glyph light
+	local clapBall = part(root, "ClapFlash", Vector3.one, Color3.new(1, 1, 1), Enum.Material.Neon)
+	clapBall.Shape = Enum.PartType.Ball
+	clapBall.CFrame = HIDE
+	local clapRing = part(root, "ClapRing", Vector3.new(0.05, 1, 1), Color3.new(1, 1, 1), Enum.Material.Neon)
+	clapRing.Shape = Enum.PartType.Cylinder
+	clapRing.CFrame = HIDE
+	local function decalCard(name: string, texture: string): (Part, Decal)
+		local p = part(root, name, Vector3.new(1, 0.05, 1), Color3.new(), Enum.Material.SmoothPlastic)
+		p.Transparency = 1
+		p.CFrame = HIDE
+		local d = Instance.new("Decal")
+		d.Face = Enum.NormalId.Top
+		d.Texture = texture
+		d.Parent = p
+		return p, d
+	end
+	local shock, shockD = decalCard("ShockRing", T("shock_ring"))
+	local crack, crackD = decalCard("SlamCrack", T("ground_crack"))
+	crackD.Color3 = Color3.fromRGB(14, 10, 22)
+	local light = Instance.new("PointLight")
+	light.Range = 16
+	light.Brightness = 0
+	light.Shadows = false
+	light.Parent = host
+
+	-- glyph circle: outer double ring, hexagram, inner ring, ticks (all thin Neon bars, drawn by angle)
+	type Seg = { p: Part, a: number, cf: CFrame, len: number, w: number, group: string }
+	local segs: { Seg } = {}
+	local glyph = Instance.new("Folder")
+	glyph.Name = "Glyph"
+	glyph.Parent = root
+	local up = CFrame.new(center) * CFrame.fromMatrix(Vector3.zero, right, Vector3.yAxis, -fwd)
+	local function seg(a: Vector3, b: Vector3, w: number, angle: number, group: string)
+		local mid = (a + b) / 2
+		local len = (b - a).Magnitude
+		local cf = up * CFrame.lookAt(mid, b)
+		local p = part(glyph, "Seg", Vector3.new(w, 0.07, len + w * 0.6), Color3.new(1, 1, 1), Enum.Material.Neon)
+		p.CFrame = HIDE
+		table.insert(segs, { p = p, a = angle, cf = cf, len = len, w = w, group = group })
+	end
+	local function ring(r: number, n: number, w: number, group: string)
+		for i = 0, n - 1 do
+			local a0, a1 = i / n * TAU, (i + 1) / n * TAU
+			seg(Vector3.new(math.cos(a0) * r, 0, math.sin(a0) * r), Vector3.new(math.cos(a1) * r, 0, math.sin(a1) * r), w, (i + 0.5) / n, group)
+		end
+	end
+	ring(6.2, 44, 0.24, "outer")
+	ring(5.55, 40, 0.12, "outer2")
+	ring(1.9, 18, 0.14, "inner")
+	local function vtx(k: number, r: number, rot: number): Vector3
+		local a = rot + k / 3 * TAU
+		return Vector3.new(math.cos(a) * r, 0, math.sin(a) * r)
+	end
+	for tri = 0, 1 do
+		local rot = -math.pi / 2 + tri * math.pi
+		for k = 0, 2 do
+			seg(vtx(k, 5.55, rot), vtx(k + 1, 5.55, rot), 0.16, (tri * 3 + k + 0.5) / 6, "hex")
+		end
+	end
+	for k = 0, 11 do
+		local a = k / 12 * TAU
+		seg(Vector3.new(math.cos(a) * 5.6, 0, math.sin(a) * 5.6), Vector3.new(math.cos(a) * 6.9, 0, math.sin(a) * 6.9), 0.14, k / 12, "tick")
+	end
+
+	-- arcs: rainbow alchemy lightning crawling over the ground from the glyph along the pillar path
+	local ARCS, ASEG = 9, 7
+	local arcParts: { Part } = {}
+	for i = 1, ARCS * ASEG do
+		local p = part(root, "Arc", Vector3.new(0.13, 0.13, 1), Color3.new(1, 1, 1), Enum.Material.Neon)
+		p.CFrame = HIDE
+		arcParts[i] = p
+	end
+
+	-- pillars: grid-aligned voxel columns (2x2 for the main line, 1x1 for the flanking walls) with real 3D studs on
+	-- every column top; main line runs along fwd with a red -> violet gradient
+	local pillars: { Pillar } = {}
+	local stone = Instance.new("Folder")
+	stone.Name = "Stone"
+	stone.Parent = root
+	local NMAIN = 8
+	local V = 1.8 -- voxel edge (studs)
+	local INSET = 0.94 -- visible seam between voxels
+	local function addPillar(k: number, main: boolean, d: number, side: number, h: number, _size: number, ts: number)
+		local m = Instance.new("Model")
+		m.Name = if main then "Pillar" .. k else "Wall" .. k
+		m.Parent = stone
+		local pos = ground + fwd * d + right * side
+		-- the whole column assembly leans a little away from the caster (stays a clean grid)
+		local lean = CFrame.Angles(R(-5 - rng:NextNumber(0, 6)), R(rng:NextNumber(-8, 8)), R(-side * 1.2))
+		local basecf = CFrame.lookAt(pos, pos + fwd) * lean
+		local blocks: { Block } = {}
+		local n = if main then 2 else 1
+		local top = 0
+		for cx = 0, n - 1 do
+			for cz = 0, n - 1 do
+				local hc = math.max(1, h + (if main then rng:NextInteger(-1, 1) else 0))
+				top = math.max(top, hc)
+				local x = (cx - (n - 1) / 2) * V
+				local z = (cz - (n - 1) / 2) * V
+				for j = 0, hc - 1 do
+					local off = CFrame.new(x, j * V + V / 2, z)
+					local sz = Vector3.one * V * INSET
+					local p = part(m, "Block" .. j, sz, Color3.new(1, 1, 1), Enum.Material.SmoothPlastic)
+					p.CastShadow = true
+					p.Reflectance = 0.04
+					p.CFrame = HIDE
+					local studs = {}
+					if j == hc - 1 then
+						for sx = -1, 1, 2 do
+							for sz2 = -1, 1, 2 do
+								local st = part(m, "Stud", Vector3.new(V * 0.16, V * 0.3, V * 0.3), Color3.new(1, 1, 1), Enum.Material.SmoothPlastic)
+								st.Shape = Enum.PartType.Cylinder
+								st.Reflectance = 0.04
+								st.CFrame = HIDE
+								table.insert(studs, { p = st, off = CFrame.new(sx * V * 0.23, V * INSET / 2 + V * 0.08, sz2 * V * 0.23) * CFrame.Angles(0, 0, math.pi / 2) })
+							end
+						end
+					end
+					table.insert(blocks, { p = p, j = j, hc = hc, size = sz, off = off, studs = studs,
+						spin = Vector3.new(rng:NextNumber(-6, 6), rng:NextNumber(-4, 4), rng:NextNumber(-6, 6)),
+						drift = right * (x / V * 2 + rng:NextNumber(-1.5, 1.5)) + fwd * rng:NextNumber(-1, 3) })
+				end
+			end
+		end
+		local y = top * V
+		local glow: PointLight? = nil
+		if main then
+			local gp = part(root, "PillarGlow", Vector3.one, Color3.new(), Enum.Material.SmoothPlastic)
+			gp.Transparency = 1
+			gp.CFrame = CFrame.new(pos + Vector3.new(0, 2.5, 0) - fwd * 2)
+			local pl = Instance.new("PointLight")
+			pl.Range = 12
+			pl.Brightness = 0
+			pl.Shadows = false
+			pl.Parent = gp
+			glow = pl
+		end
+		local hl = Instance.new("Highlight")
+		hl.FillTransparency = 1
+		hl.OutlineColor = Color3.fromRGB(14, 10, 24)
+		hl.OutlineTransparency = 0.25
+		hl.DepthMode = Enum.HighlightDepthMode.Occluded
+		hl.Parent = m
+		local debris = {}
+		for _ = 1, if main then 6 else 2 do
+			local s = V * rng:NextNumber(0.25, 0.42)
+			local dp = part(root, "Debris", Vector3.one * s, Color3.new(1, 1, 1), Enum.Material.SmoothPlastic)
+			dp.CFrame = HIDE
+			local dir = (right * rng:NextNumber(-1, 1) + fwd * rng:NextNumber(-0.6, 1)).Unit
+			table.insert(debris, { p = dp, v = dir * rng:NextNumber(6, 15) + Vector3.new(0, rng:NextNumber(16, 30), 0),
+				w = Vector3.new(rng:NextNumber(-12, 12), rng:NextNumber(-12, 12), rng:NextNumber(-12, 12)), p0 = pos + Vector3.new(0, 0.6, 0) })
+		end
+		table.insert(pillars, { model = m, base = basecf, ts = ts, tc = 3.0 + d * 0.018 + (if main then 0 else 0.05), h = top,
+			height = y, blocks = blocks, k = k, main = main, glow = glow, fired = false, crumbleFired = false, debris = debris })
+	end
+	for k = 1, NMAIN do
+		local d = 7.4 + (k - 1) * 3.7
+		local side = (if k % 2 == 0 then 1 else -1) * rng:NextNumber(0.2, 1.0)
+		local h = 2 + math.floor(k * 0.7)
+		addPillar(k, true, d, side, h, 0, 0.66 + (k - 1) * 0.085)
+	end
+	for k = 1, NMAIN - 1 do
+		local d = 9.2 + (k - 1) * 3.7
+		for _, sd in { -1, 1 } do
+			addPillar(k, false, d, sd * (4.6 + k * 0.35 + rng:NextNumber(-0.3, 0.3)), math.max(1, math.floor(k * 0.45) + 1), 0,
+				0.72 + (k - 1) * 0.085 + rng:NextNumber(0, 0.03))
+		end
+	end
+
+	-- caster: animate a client-local clone without an Animator (the Humanoid's Animator would reset Transform every
+	-- frame). An NPC original is unparented locally for the duration; a player's character stays in place (camera and
+	-- controls keep working) but is hidden and anchored locally. Both are restored in finish().
+	if caster then
+		local clone = CasterState.clone(ctx, caster)
+		for _, d in clone:GetDescendants() do
+			if d:IsA("Animator") or d:IsA("Script") or d:IsA("LocalScript") then
+				d:Destroy()
+			end
+		end
+		local hum = clone:FindFirstChildOfClass("Humanoid")
+		if hum then
+			hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+		end
+		local cloneRoot = clone:FindFirstChild("HumanoidRootPart")
+		if cloneRoot and cloneRoot:IsA("BasePart") then
+			cloneRoot.Anchored = true
+		end
+		clone.Name = "CasterPose"
+		clone.Parent = root
+		caster = clone
+	end
+	-- joints: classic Motor6D rigs or the newer AnimationConstraint rigs (made kinematic so Transform is exact)
+	local motors: { [string]: any } = {}
+	if caster then
+		for _, d in caster:GetDescendants() do
+			if d:IsA("Motor6D") then
+				motors[d.Name] = d
+			elseif d:IsA("AnimationConstraint") then
+				(d :: any).IsKinematic = true
+				motors[d.Name] = d
+			end
+		end
+	end
+	local hands = caster and { caster:FindFirstChild("LeftHand") :: BasePart?, caster:FindFirstChild("RightHand") :: BasePart? } or {}
+
+
+	local fired: { [string]: boolean } = {}
+	local function once(key: string, t: number, at: number): boolean
+		if not fired[key] and t >= at then
+			fired[key] = true
+			return true
+		end
+		return false
+	end
+
+	local lastArcSlot = -1
+	local function finish()
+		for _, m in motors do
+			m.Transform = CFrame.identity
+		end
+		EarthRise.currentT = nil
+	end
+
+	local function step(t: number)
+		EarthRise.currentT = t
+
+		-- pose (RenderStepped/Animator-free rig: Transform persists)
+		local pose = poseAt(t)
+		for name, m in motors do
+			local cf = pose[name]
+			if cf then
+				m.Transform = cf
+			end
+		end
+
+		local hue0 = t * 0.35
+
+		-- clap
+		local handMid = center + Vector3.new(0, 3.2, 0) - fwd * 1.6
+		if hands[1] and hands[2] then
+			handMid = ((hands[1] :: BasePart).Position + (hands[2] :: BasePart).Position) / 2
+		end
+		local tc = t - 0.29
+		if tc >= 0 and tc < 0.32 then
+			local u = tc / 0.32
+			clapBall.Size = Vector3.one * (0.6 + 3.4 * math.sqrt(u))
+			clapBall.CFrame = CFrame.new(handMid)
+			clapBall.Transparency = u ^ 0.7
+			clapBall.Color = Color3.new(1, 1, 1):Lerp(rainbow(hue0 + u * 0.5), u)
+			clapRing.Size = Vector3.new(0.05, 1, 1) * Vector3.new(1, 1.5 + 9 * u, 1.5 + 9 * u)
+			clapRing.CFrame = CFrame.new(handMid) * CFrame.fromMatrix(Vector3.zero, fwd, Vector3.yAxis) * CFrame.Angles(0, 0, 0)
+			clapRing.Transparency = 0.6 + 0.4 * u
+			clapRing.Color = rainbow(hue0 + 0.3)
+		else
+			clapBall.CFrame = HIDE
+			clapRing.CFrame = HIDE
+		end
+		if once("clap", t, 0.29) then
+			emitAt(sparks, handMid, 40)
+			emitAt(glints, handMid, 14)
+		end
+
+		-- slam: shock ring, crack decal, dust
+		local tsl = t - 0.62
+		if tsl >= 0 and tsl < 0.6 then
+			local u = tsl / 0.6
+			local r = 3 + 26 * (1 - (1 - u) ^ 3)
+			shock.Size = Vector3.new(r, 0.05, r)
+			shock.CFrame = CFrame.new(center + Vector3.new(0, 0.04, 0))
+			shockD.Transparency = u ^ 1.3
+			shockD.Color3 = rainbow(hue0 + u * 0.4)
+		else
+			shock.CFrame = HIDE
+		end
+		if tsl >= 0 and t < 3.4 then
+			local u = smooth(tsl / 0.12)
+			crack.Size = Vector3.new(15 * u + 0.1, 0.05, 15 * u + 0.1)
+			crack.CFrame = CFrame.new(center + Vector3.new(0, 0.03, 0))
+			crackD.Transparency = 0.05 + 0.95 * smooth((t - 2.8) / 0.6)
+		else
+			crack.CFrame = HIDE
+		end
+		if once("slam", t, 0.62) then
+			emitAt(dust, center, 26)
+			emitAt(sparks, center + Vector3.new(0, 0.4, 0), 50)
+		end
+
+		-- glyph: draw on 0.62-0.86 by angle (outer clockwise, hex after, ticks last), glow pulse, fade 2.5-3.1
+		local draw = smooth((t - 0.6) / 0.26)
+		local fade = smooth((t - 2.5) / 0.6)
+		local spin = CFrame.Angles(0, t * 0.6, 0)
+		for _, s in segs do
+			local gate = if s.group == "hex" then smooth((t - 0.7) / 0.18) elseif s.group == "tick" then smooth((t - 0.8) / 0.12) else draw
+			if s.a < gate and fade < 1 then
+				local pulse = 0.5 + 0.5 * math.sin(t * 14 - s.a * TAU * 2)
+				s.p.CFrame = (if s.group == "outer" or s.group == "tick" then CFrame.new(center) * spin * CFrame.new(-center) else CFrame.identity) * s.cf
+				s.p.Transparency = math.clamp(fade + (if t < 1.0 then 0 else 0.15 * pulse), 0, 1)
+				local hot = smooth((t - 0.62 - s.a * 0.24) / 0.25)
+				s.p.Color = Color3.new(1, 1, 1):Lerp(rainbow(s.a + hue0 + (if s.group == "hex" then 0.5 else 0)), hot)
+			else
+				s.p.CFrame = HIDE
+			end
+		end
+		light.Brightness = if t > 0.6 and t < 3.0 then (0.9 + 0.6 * math.sin(t * 9)) * (1 - fade) + 2.5 * (1 - smooth(tsl / 0.3)) else 0
+		light.Color = rainbow(hue0)
+		host.CFrame = CFrame.new(center + Vector3.new(0, 2, 0))
+
+		-- arcs 0.6-2.1: reseed every 0.04 s, crawl outward toward pillar bases
+		local arcOn = t >= 0.6 and t < 2.1
+		local slot = math.floor(t / 0.04)
+		if arcOn and slot ~= lastArcSlot then
+			lastArcSlot = slot
+			local ar = Random.new(1000 + slot)
+			local reach = 6 + 26 * smooth((t - 0.6) / 0.8)
+			for a = 0, ARCS - 1 do
+				local target = center + fwd * ar:NextNumber(2, reach) + right * ar:NextNumber(-7, 7)
+				if a < 3 then
+					local ang = ar:NextNumber(0, TAU)
+					target = center + (right * math.cos(ang) + fwd * math.sin(ang)) * 6.2
+				end
+				local from = center + (right * ar:NextNumber(-1, 1) + fwd * ar:NextNumber(-1, 1)) * 1.5
+				local prev = from
+				local hue = hue0 + a / ARCS
+				for sI = 1, ASEG do
+					local u = sI / ASEG
+					local pt = from:Lerp(target, u)
+					if sI < ASEG then
+						pt += right * ar:NextNumber(-1.1, 1.1) + fwd * ar:NextNumber(-0.8, 0.8) + Vector3.new(0, ar:NextNumber(0.1, 1.3), 0)
+					end
+					local p = arcParts[a * ASEG + sI]
+					local len = (pt - prev).Magnitude
+					p.Size = Vector3.new(0.13, 0.13, len + 0.1)
+					p.CFrame = CFrame.lookAt((prev + pt) / 2, pt)
+					p.Color = rainbow(hue + u * 0.25, 0.75)
+					prev = pt
+				end
+			end
+		elseif not arcOn and lastArcSlot ~= -2 then
+			lastArcSlot = -2
+			for _, p in arcParts do
+				p.CFrame = HIDE
+			end
+		end
+		if arcOn then
+			local at = math.clamp(smooth((t - 1.6) / 0.5), 0, 1)
+			for _, p in arcParts do
+				p.Transparency = at
+			end
+		end
+
+		-- pillars
+		for _, pl in pillars do
+			local u = (t - pl.ts) / 0.24
+			if u < 0 then
+				for _, b in pl.blocks do
+					b.p.CFrame = HIDE
+					for _, st in b.studs do
+						st.p.CFrame = HIDE
+					end
+				end
+				continue
+			end
+			if not pl.fired then
+				pl.fired = true
+				local pos = pl.base.Position
+				emitAt(dust, pos, if pl.main then 10 else 5)
+				emitAt(glints, pos + Vector3.new(0, 1, 0), if pl.main then 8 else 3)
+				if pl.main then
+					emitAt(sparks, pos + Vector3.new(0, 0.5, 0), 12)
+				end
+			end
+			local rise = easeOutBack(u)
+			local sink = (1 - rise) * (pl.height + 1.5)
+			local crumbleT = t - pl.tc
+			if crumbleT >= 0 and not pl.crumbleFired then
+				pl.crumbleFired = true
+				emitAt(dust, pl.base.Position + Vector3.new(0, pl.height * 0.5, 0), if pl.main then 9 else 4)
+			end
+			local frac = pl.k / NMAIN
+			local glow = pl.glow
+			if glow then
+				local on = smooth((t - pl.ts) / 0.15) * (1 - smooth((t - pl.tc) / 0.5))
+				glow.Brightness = 0.8 * on + 2.0 * on * math.exp(-(t - pl.ts) * 5)
+				glow.Color = rainbow(frac * 0.82 + t * 0.12)
+			end
+			for _, b in pl.blocks do
+				local cf = pl.base * CFrame.new(0, -sink, 0) * b.off
+				local hot = smooth((t - pl.ts - 0.06) / 0.28)
+				-- gradient: hue by wave position, small step up the column; value shading darker at the base
+				local row = b.j / math.max(1, pl.h - 1)
+				local hue = frac * 0.82 + b.j * 0.028 + (if pl.main then 0 else 0.06) + t * 0.12
+				local col = Color3.new(1, 1, 1):Lerp(rainbow(hue, 0.88, 0.5 + 0.38 * row), hot)
+				local studCol = Color3.new(1, 1, 1):Lerp(rainbow(hue + 0.02, 0.82, 0.92), hot)
+				local tr = 0
+				local scale = 1
+				local ct = crumbleT - (b.hc - 1 - b.j) * 0.05
+				if ct > 0 then
+					local g = ct
+					local fall = 0.5 * 52 * g * g
+					cf = CFrame.new(cf.Position + b.drift * g - Vector3.new(0, fall, 0))
+						* (cf - cf.Position) * CFrame.Angles(b.spin.X * g, b.spin.Y * g, b.spin.Z * g)
+					if cf.Position.Y < ground.Y - 1 then
+						cf = cf + Vector3.new(0, ground.Y - 1 - cf.Position.Y, 0)
+					end
+					scale = math.max(0.05, 1 - g / 0.9)
+					tr = smooth(g / 0.9)
+					col = col:Lerp(Color3.fromRGB(40, 36, 44), smooth(g / 0.5))
+					studCol = col
+				end
+				b.p.Size = b.size * scale
+				b.p.CFrame = cf
+				b.p.Color = col
+				b.p.Transparency = tr
+				for _, st in b.studs do
+					st.p.Size = Vector3.new(V * 0.16, V * 0.3, V * 0.3) * scale
+					st.p.CFrame = cf * CFrame.new(st.off.Position * scale) * (st.off - st.off.Position)
+					st.p.Color = studCol
+					st.p.Transparency = tr
+				end
+			end
+			-- debris (ballistic from emergence, rests on the ground, fades)
+			local dtau = t - pl.ts
+			for i, d in pl.debris do
+				if dtau > 1.7 then
+					d.p.CFrame = HIDE
+				else
+					local p = d.p0 + d.v * dtau - Vector3.new(0, 0.5 * 60 * dtau * dtau, 0)
+					local landed = p.Y < ground.Y + 0.3
+					if landed then
+						p = Vector3.new(p.X, ground.Y + 0.3, p.Z)
+					end
+					d.p.CFrame = CFrame.new(p) * CFrame.Angles(d.w.X * dtau, d.w.Y * dtau, d.w.Z * dtau)
+					d.p.Color = if i % 2 == 0 then Color3.fromRGB(46, 40, 50) else rainbow(frac * 0.82 + i * 0.07 + t * 0.12, 0.8, 0.95)
+					d.p.Transparency = smooth((dtau - 1.1) / 0.6)
+				end
+			end
+		end
+	end
+
+	table.insert(ctx.cleanups, finish)
+	return step
+end
+
+-- camera shake offset for the harness camera (pure function of effect time)
+function EarthRise.shake(t: number): Vector3
+	local a = 0
+	a += 0.55 * math.exp(-(t - 0.62) * 9) * (if t >= 0.62 then 1 else 0)
+	if t >= 0.66 and t < 1.6 then
+		a += 0.32
+	end
+	a += 0.25 * math.exp(-(t - 3.0) * 4) * (if t >= 3.0 then 1 else 0)
+	a = math.min(a, 0.7)
+	return Vector3.new(math.sin(t * 91) * a, math.sin(t * 77 + 1.3) * a * 0.7, math.sin(t * 63 + 2.1) * a * 0.5)
+end
+
+return EarthRise
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="9">
+          <Properties>
+            <string name="Name">PrismCleave</string>
+            <string name="Source"><![CDATA[--!strict
+--[[ PrismCleave: a charged dash-slash, cinematic beat by beat.
+	0.00-0.28  CHARGE: arms cross at the chest, a starburst of white-hot spikes with rainbow halos, flash, glints
+	0.10-0.80  AURA: soft glow orb plus two rainbow swirl arcs orbiting the caster
+	0.30-0.86  WIND-UP: low wide stance, blade arm drawn back; three tilted rainbow crescent rings spin round the
+	           caster and tighten, white-hot edge bands on their heads
+	0.86       DASH: the caster lunges 14 studs forward in 0.07 s. One long white-hot slash line runs the whole
+	           rainbow along the path, with a lens-flare star at the cut and a forward crescent wave.
+	0.88-1.70  AFTERMATH: two jagged walls of spray erupt along both sides of the path in a ripple, rainbow from
+	           near to far. Plus a glowing ground scar that cools to ink, debris, dust and a hard light kick.
+	1.70-2.10  hold, the scar fades, the dash ghost fades out; the caster is restored where it started
+	cf = caster root CFrame (LookVector = dash direction). opts.caster = R15 model to pose (optional). Life 2.1 s. ]]
+local Workspace = game:GetService("Workspace")
+local Kit = require(script.Parent.Parent.Kit)
+local Pose = require(script.Parent.Parent.Pose)
+
+local PrismCleave = {}
+PrismCleave.life = 2.1
+PrismCleave.required = { "slash_body", "slash_edge", "bolt_glow", "spark_streak", "spark_glint", "glow_soft", "smoke_puff", "ice_shard" }
+
+local A, arm = Pose.A, Pose.arm
+local DASH_T, DASH_END, DASH_D = 0.86, 0.93, 14
+local KEYS: { Pose.Key } = {
+	{ t = 0.0, p = {} },
+	{ t = 0.12, p = { -- charge: blades crossed at the chest, slight crouch
+		Root = CFrame.new(0, -0.3, 0), Waist = A(-6, 0, 0), Neck = A(-8, 0, 0),
+		RightShoulder = arm(78, 48, 0), LeftShoulder = arm(78, -48, 0), RightElbow = A(62, 0, 0), LeftElbow = A(62, 0, 0),
+		RightHip = A(14, 0, 0), LeftHip = A(14, 0, 0), RightKnee = A(-22, 0, 0), LeftKnee = A(-22, 0, 0) } },
+	{ t = 0.28, p = "SAME" :: any },
+	{ t = 0.45, p = { -- wind-up: low wide stance, torso coiled, blade arm drawn back, guard arm forward
+		Root = CFrame.new(0, -0.95, 0) * A(-8, 30, 0), Waist = A(-4, 28, 0), Neck = A(0, -40, 0),
+		RightShoulder = arm(20, -50, 75), RightElbow = A(25, 0, 0),
+		LeftShoulder = arm(85, 15, 0), LeftElbow = A(10, 0, 0),
+		RightHip = A(55, 0, 18), LeftHip = A(20, 0, -22), RightKnee = A(-75, 0, 0), LeftKnee = A(-35, 0, 0) } },
+	{ t = 0.84, p = "SAME2" :: any },
+	{ t = 0.92, p = { -- the cut: lunged low, blade arm swept through to the front-left, guard arm thrown back
+		Root = CFrame.new(0, -1.05, 0) * A(-22, -30, 0), Waist = A(-12, -35, 0), Neck = A(10, 40, 0),
+		RightShoulder = arm(88, 70, 0), RightElbow = A(4, 0, 0),
+		LeftShoulder = arm(-25, 0, -55), LeftElbow = A(15, 0, 0),
+		RightHip = A(75, 0, 0), LeftHip = A(-35, 0, 0), RightKnee = A(-80, 0, 0), LeftKnee = A(-20, 0, 0) } },
+	{ t = 1.55, p = "SAME3" :: any },
+	{ t = 1.95, p = { Root = CFrame.new(0, -0.3, 0), RightShoulder = arm(30, 30, 0), LeftShoulder = arm(10, 0, -20) } },
+	{ t = 2.1, p = "SAME4" :: any },
+}
+KEYS[3].p = KEYS[2].p
+KEYS[5].p = KEYS[4].p
+KEYS[7].p = KEYS[6].p
+KEYS[9].p = KEYS[8].p
+
+type Arc = { atts: { Attachment }, body: { Beam }, edge: { Beam } }
+local NSEG = 12
+
+function PrismCleave.build(ctx: Kit.Ctx): (number) -> ()
+	local S = ctx.opts.scale
+	local cf = ctx.cf
+	local fwd = (cf.LookVector * Vector3.new(1, 0, 1)).Unit
+	local right = fwd:Cross(Vector3.yAxis).Unit
+	local params = RaycastParams.new()
+	local ex: { Instance } = { ctx.root }
+	if ctx.opts.caster then
+		table.insert(ex, ctx.opts.caster)
+	end
+	params.FilterDescendantsInstances = ex
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local hit = Workspace:Raycast(cf.Position, Vector3.new(0, -14, 0), params)
+	local gy = if hit then hit.Position.Y else cf.Position.Y - 3
+	local ground = Vector3.new(cf.X, gy, cf.Z)
+	local chest = cf.Position + Vector3.yAxis * 0.6 * S
+	local once = Kit.once()
+	local rng = ctx.rng
+	local rig = Pose.rig(ctx, ctx.opts.caster)
+
+	------------------------------------------------------------------ helpers
+	local function newArc(name: string): Arc
+		local atts, body, edge = {}, {}, {}
+		for k = 0, NSEG do
+			atts[k + 1] = Kit.att(ctx)
+		end
+		for k = 1, NSEG do
+			local b = Kit.beam(ctx, atts[k], atts[k + 1], "slash_body", 0)
+			b.Name = name .. "Body"
+			b.FaceCamera = false
+			b.Segments = 10
+			b.LightEmission = 0.8
+			b.Brightness = 2
+			body[k] = b
+			local e = Kit.beam(ctx, atts[k], atts[k + 1], "slash_edge", 1)
+			e.Name = name .. "Edge"
+			e.FaceCamera = false
+			e.Segments = 10
+			e.Brightness = 7
+			edge[k] = e
+		end
+		return { atts = atts, body = body, edge = edge }
+	end
+	local function hideArc(a: Arc)
+		for k = 1, NSEG do
+			a.body[k].Enabled = false
+			a.edge[k].Enabled = false
+		end
+	end
+	-- crescent in the plane (u, v) round centre: from angle th0, `span` long (sign = direction), radius R, thickness
+	-- tapering to points; vis(f) = visibility along the arc (f 0 = tail, 1 = head); hue run h0..h0+hs
+	local function drawArc(a: Arc, center: Vector3, u: Vector3, v: Vector3, th0: number, span: number, R: number,
+		thick: number, vis: (number) -> number, h0: number, hs: number, edgeBand: number)
+		local dir = if span >= 0 then 1 else -1
+		for k = 0, NSEG do
+			local f = k / NSEG
+			local w = thick * (0.04 + 0.96 * math.sin(math.pi * f) ^ 0.7)
+			local th = th0 + span * f
+			local radial = u * math.cos(th) + v * math.sin(th)
+			local tang = (u * -math.sin(th) + v * math.cos(th)) * dir
+			a.atts[k + 1].CFrame = CFrame.fromMatrix(center + radial * (R - w / 2), tang, radial)
+			if k > 0 then
+				a.body[k].Width1 = w
+				a.edge[k].Width1 = w
+			end
+			if k < NSEG then
+				a.body[k + 1].Width0 = w
+				a.edge[k + 1].Width0 = w
+			end
+		end
+		local kc = 4 / 3 * math.tan(math.abs(span) / NSEG / 4) * R
+		for k = 1, NSEG do
+			local fa, fb = (k - 1) / NSEG, k / NSEG
+			local pb, pe = {}, {}
+			for q = 0, 4 do
+				local f = fa + (fb - fa) * q / 4
+				local vv = vis(f)
+				table.insert(pb, { q / 4, 1 - vv })
+				table.insert(pe, { q / 4, 1 - vv * Kit.smooth((f - (1 - edgeBand)) / edgeBand) })
+			end
+			local b, e = a.body[k], a.edge[k]
+			b.Enabled, e.Enabled = true, true
+			b.CurveSize0, b.CurveSize1, e.CurveSize0, e.CurveSize1 = kc, kc, kc, kc
+			b.Transparency = Kit.numSeq(pb)
+			e.Transparency = Kit.numSeq(pe)
+			b.Color = Kit.hueSeq(h0 + hs * fa, hs / NSEG, 0.85, 1, 2)
+			e.Color = ColorSequence.new(Kit.hot(h0 + hs * fb))
+		end
+	end
+	-- straight glowing streak: core + halo beams between two points (camera-facing)
+	type Streak = { a0: Attachment, a1: Attachment, core: Beam, halo: Beam }
+	local function newStreak(name: string): Streak
+		local a0, a1 = Kit.att(ctx), Kit.att(ctx)
+		local halo = Kit.beam(ctx, a0, a1, "bolt_glow", 0)
+		halo.Name = name .. "Halo"
+		halo.Segments = 1
+		halo.Brightness = 3
+		local core = Kit.beam(ctx, a0, a1, "bolt_glow", 1)
+		core.Name = name .. "Core"
+		core.Segments = 1
+		core.Brightness = 6
+		return { a0 = a0, a1 = a1, core = core, halo = halo }
+	end
+
+	------------------------------------------------------------------ layers
+	-- starburst spikes
+	type Spike = { s: Streak, dir: Vector3, len: number, hue: number }
+	local spikes: { Spike } = {}
+	for k = 1, 22 do
+		local az = rng:NextNumber(0, math.pi * 2)
+		local el = rng:NextNumber(-0.35, 1.1)
+		local d = Vector3.new(math.cos(az), el, math.sin(az)).Unit
+		table.insert(spikes, { s = newStreak("Spike"), dir = d, len = rng:NextNumber(3.5, 8) * S, hue = k / 22 })
+	end
+	-- aura swirls and vortex rings
+	local swirls = { newArc("Swirl1"), newArc("Swirl2") }
+	local rings = { newArc("Ring1"), newArc("Ring2"), newArc("Ring3") }
+	local RING_TILT = { 0, math.rad(28), math.rad(-22) }
+	local RING_R = { 3.6, 4.4, 5.2 }
+	local RING_W = { 13, -11, 9.5 } -- spin, rad/s
+	local wave = newArc("Wave")
+	-- the cut line along the dash path (bulging width: two halves)
+	local cutA, cutB = newStreak("CutA"), newStreak("CutB")
+	-- spray walls: jagged spikes along both sides of the path
+	type Spray = { s: Streak, d: number, side: number, h: number, hue: number, t0: number, base: Vector3 }
+	local sprays: { Spray } = {}
+	for i = 0, 15 do
+		local d = (2 + i * 1.45) * S
+		for _, side in { -1, 1 } do
+			for j = 1, 2 do
+				local lat = (1.8 + d * 0.06 + rng:NextNumber(-0.3, 0.5)) * side
+				local base = ground + fwd * (d + rng:NextNumber(-0.5, 0.5)) + right * lat
+				local sk = newStreak("Spray")
+				sk.core.Brightness = 3.5
+				sk.halo.Brightness = 2.5
+				table.insert(sprays, { s = sk, d = d, side = side, h = rng:NextNumber(4, 8) * S * (1 - d / (45 * S)),
+					hue = d / (26 * S), t0 = DASH_T + 0.02 + d / S * 0.006 + j * 0.015, base = base })
+			end
+		end
+	end
+	-- ground scar: a flat ribbon lying along the path
+	local scarA0, scarA1 = Kit.att(ctx), Kit.att(ctx)
+	local scar = Kit.beam(ctx, scarA0, scarA1, "slash_edge", -1)
+	scar.Name = "Scar"
+	scar.FaceCamera = false
+	scar.Segments = 1
+	scar.TextureMode = Enum.TextureMode.Stretch
+
+	local flash = Kit.burst(ctx, "Flash", { tex = "glow_soft", life = { 0.1 }, size = { { 0, 4 }, { 0.4, 8 }, { 1, 9 } },
+		transp = { { 0, 0.2 }, { 0.5, 0.55 }, { 1, 1 } }, bright = 3, zoff = 3 })
+	local orb = Kit.burst(ctx, "Orb", { tex = "glow_soft", life = { 0.7 }, size = { { 0, 3 }, { 0.3, 8 }, { 1, 9 } },
+		transp = { { 0, 1 }, { 0.2, 0.55 }, { 0.8, 0.65 }, { 1, 1 } }, bright = 2, zoff = 1 })
+	local glints = Kit.burst(ctx, "Glints", { tex = "spark_glint", life = { 0.18, 0.3 }, size = { { 0, 0 }, { 0.2, 3 }, { 1, 0 } },
+		speed = { 0.5, 2 }, spread = 180, rot = { 0, 30 }, bright = 6, zoff = 2 })
+	local star = Kit.burst(ctx, "Star", { tex = "spark_glint", life = { 0.22 }, size = { { 0, 4 }, { 0.15, 16 }, { 1, 0 } },
+		rot = { 0, 0 }, bright = 9, zoff = 4 })
+	local sparks = Kit.burst(ctx, "Sparks", { tex = "spark_streak", life = { 0.25, 0.5 }, size = { { 0, 1.1 }, { 1, 0 } },
+		speed = { 30, 55 }, spread = 22, drag = 3.5, acc = Vector3.new(0, -30, 0), vpar = true, bright = 4 })
+	local spray = Kit.burst(ctx, "SprayPuff", { tex = "smoke_puff", life = { 0.45, 0.8 }, size = { { 0, 1.2 }, { 1, 3.6 } },
+		transp = { { 0, 0.35 }, { 0.5, 0.6 }, { 1, 1 } }, speed = { 10, 18 }, spread = 20, drag = 3, acc = Vector3.new(0, -6, 0),
+		rot = { 0, 360 }, rotSpeed = { -90, 90 }, le = 0.5, bright = 1 })
+	local debris = Kit.burst(ctx, "Debris", { tex = "ice_shard", life = { 0.5, 0.9 }, size = { { 0, 1.2 }, { 1, 0.4 } },
+		speed = { 14, 28 }, spread = 25, drag = 1.5, acc = Vector3.new(0, -50, 0), rot = { 0, 360 }, rotSpeed = { -500, 500 }, le = 0, bright = 1 })
+	local lightHost = Kit.part(ctx, ctx.root, "LightHost", Vector3.one * 0.2, Color3.new(), Enum.Material.SmoothPlastic)
+	lightHost.Transparency = 1
+	local light = Kit.light(ctx, lightHost, 26 * S)
+
+	local function streakSet(s: Streak, p0: Vector3, p1: Vector3, w0: number, w1: number, vis: number, hot: Color3, halo: ColorSequence, haloMul: number)
+		s.a0.CFrame = CFrame.new(p0)
+		s.a1.CFrame = CFrame.new(p1)
+		local on = vis > 0.01
+		s.core.Enabled, s.halo.Enabled = on, on
+		if on then
+			s.core.Width0, s.core.Width1 = w0 * 0.35, w1 * 0.35
+			s.halo.Width0, s.halo.Width1 = w0 * haloMul, w1 * haloMul
+			s.core.Color = ColorSequence.new(hot)
+			s.halo.Color = halo
+			s.core.Transparency = NumberSequence.new(1 - vis)
+			s.halo.Transparency = NumberSequence.new(1 - vis * 0.8)
+		end
+	end
+
+	return function(t: number)
+		local h = Kit.hue(ctx, t, 0)
+		-- caster pose + dash
+		local dashD = DASH_D * S * Kit.easeOut(Kit.ramp(t, DASH_T, DASH_END))
+		if rig then
+			rig.apply(Pose.sample(KEYS, t))
+			if rig.root0 then
+				rig.move(rig.root0 + fwd * dashD)
+			end
+			rig.fade(Kit.ramp(t, 1.75, 1.98))
+		end
+		local casterPos = chest + fwd * dashD
+
+		-- CHARGE starburst
+		for _, sp in spikes do
+			local g = Kit.easeOut(Kit.ramp(t, 0.0, 0.07))
+			local fade = 1 - Kit.ramp(t, 0.1, 0.28)
+			local L = sp.len * g * (1 + 0.25 * Kit.ramp(t, 0.07, 0.28))
+			local p0 = chest + sp.dir * (0.6 + 0.8 * Kit.ramp(t, 0.07, 0.28)) * S
+			streakSet(sp.s, p0, p0 + sp.dir * L, 0.9 * S, 0.02, if t < 0.28 then fade else 0, Kit.hot(h + sp.hue),
+				ColorSequence.new(Kit.col(h + sp.hue, 0.85, 1)), 3.2)
+		end
+		if once("flash", t, 0.02) then
+			Kit.spray(ctx, flash, chest, 1, ColorSequence.new(Kit.hot(h)), "point")
+			Kit.spray(ctx, glints, chest, 6, ColorSequence.new(Kit.hot(h)), "sphere", 2.5)
+		end
+		if once("orb", t, 0.1) then
+			Kit.spray(ctx, orb, chest, 1, ColorSequence.new(Kit.col(h + 0.55, 0.55, 1)), "point")
+		end
+
+		-- AURA swirls (orbiting arcs)
+		for i, a in swirls do
+			local on = Kit.ramp(t, 0.1, 0.22) * (1 - Kit.ramp(t, 0.62, 0.8))
+			if on > 0 then
+				local tilt = if i == 1 then math.rad(70) else math.rad(-60)
+				local u = fwd
+				local v = (right * math.cos(tilt) + Vector3.yAxis * math.sin(tilt)).Unit
+				drawArc(a, chest, u, v, t * (if i == 1 then 10 else -12), math.rad(200) * (if i == 1 then 1 else -1), 2.6 * S, 0.9 * S,
+					function(f)
+						return on * Kit.smooth(f * 3) * 0.85
+					end, h + i * 0.4, 0.5, 0.35)
+			else
+				hideArc(a)
+			end
+		end
+
+		-- WIND-UP vortex rings: spin, brighten, tighten, collapse into the dash
+		for i, a in rings do
+			local on = Kit.ramp(t, 0.3 + i * 0.04, 0.42 + i * 0.04) * (1 - Kit.ramp(t, DASH_T - 0.02, DASH_T + 0.05))
+			if on > 0 then
+				local tilt = RING_TILT[i]
+				local u = fwd
+				local v = (right * math.cos(tilt) + Vector3.yAxis * math.sin(tilt)).Unit
+				local tighten = Kit.easeIn(Kit.ramp(t, 0.45, DASH_T))
+				local R = (RING_R[i] - 1.2 * tighten) * S
+				drawArc(a, chest - Vector3.yAxis * 0.4 * S, u, v, t * RING_W[i], math.rad(280) * (if RING_W[i] > 0 then 1 else -1), R,
+					(1.1 + 0.5 * tighten) * S, function(f)
+						return on * Kit.smooth(f * 2.5)
+					end, h + i * 0.33, 0.85, 0.3)
+			else
+				hideArc(a)
+			end
+		end
+		if once("windglint", t, 0.55) then
+			Kit.spray(ctx, glints, chest, 5, ColorSequence.new(Kit.hot(h + 0.3)), "sphere", 4)
+		end
+
+		-- DASH: forward crescent wave
+		local tw = t - DASH_T
+		if tw >= 0 and tw < 0.3 then
+			local k = tw / 0.3
+			local center = chest + fwd * (2 + 18 * Kit.easeOut(k)) * S - fwd * 5 * S
+			drawArc(wave, center, fwd, right, -math.rad(75), math.rad(150), 6 * S, 2.4 * S, function(f)
+				return (1 - Kit.easeIn(k)) * Kit.smooth((f - k * 0.5) / 0.2 + 0.5)
+			end, h + 0.15, 0.6, 0.4)
+		else
+			hideArc(wave)
+		end
+		-- the cut line: draws out in 0.04 s, bulges, thins out
+		local tc = t - (DASH_T + 0.01)
+		if tc >= 0 and tc < 0.45 then
+			local grow = Kit.easeOut(tc / 0.04)
+			local vis = 1 - Kit.ramp(tc, 0.12, 0.45)
+			local thin = 1 - 0.75 * Kit.ramp(tc, 0.04, 0.45)
+			local p0 = chest + fwd * 0.5 * S
+			local len = 26 * S * grow
+			local mid = p0 + fwd * len * 0.45 + Vector3.yAxis * 0.25 * S
+			local p1 = p0 + fwd * len + Vector3.yAxis * 0.6 * S
+			local W = 1.5 * S * thin
+			streakSet(cutA, p0, mid, 0.05, W, vis, Kit.hot(h), Kit.hueSeq(h, 0.45, 0.9, 1, 4), 3)
+			streakSet(cutB, mid, p1, W, 0.03, vis, Kit.hot(h + 0.5), Kit.hueSeq(h + 0.45, 0.55, 0.9, 1, 4), 3)
+		else
+			cutA.core.Enabled, cutA.halo.Enabled, cutB.core.Enabled, cutB.halo.Enabled = false, false, false, false
+		end
+		if once("star1", t, DASH_T + 0.03) then
+			Kit.spray(ctx, star, chest + fwd * 9 * S, 1, ColorSequence.new(Kit.hot(h)), "point")
+			Kit.spray(ctx, flash, chest + fwd * 9 * S, 1, ColorSequence.new(Kit.col(h + 0.1, 0.5, 1)), "point")
+		end
+		if once("star2", t, DASH_T + 0.08) then
+			Kit.spray(ctx, star, chest + fwd * 17 * S + Vector3.yAxis * 0.4, 1, ColorSequence.new(Kit.hot(h + 0.5)), "point")
+		end
+		-- spray walls ripple along the path, rainbow from near to far
+		for _, s in sprays do
+			local ts = t - s.t0
+			if ts >= 0 and ts < 0.85 then
+				local rise = Kit.easeOutBack(ts / 0.08)
+				local vis = 1 - Kit.ramp(ts, 0.3, 0.85)
+				local lean = s.base + right * s.side * 0.8 * S * rise
+				local top = lean + Vector3.yAxis * s.h * rise * (1 - 0.35 * Kit.ramp(ts, 0.3, 0.85))
+				streakSet(s.s, s.base, top, 2.0 * S, 0.02, vis, Kit.col(h + s.hue, 0.25, 1), Kit.hueSeq(h + s.hue, 0.08, 0.9, 1, 2), 2.0)
+				if once(string.format("sp%.2f_%d", s.d, s.side), ts, 0) then
+					local out = (right * s.side + Vector3.yAxis * 1.4).Unit
+					Kit.spray(ctx, spray, s.base, 1, ColorSequence.new(Kit.col(h + s.hue, 0.75, 1)), "point", 0, 0, out)
+					Kit.spray(ctx, sparks, s.base, 2, ColorSequence.new(Kit.col(h + s.hue, 0.7, 1)), "point", 0, 0, out)
+				end
+			else
+				s.s.core.Enabled, s.s.halo.Enabled = false, false
+			end
+		end
+		if once("debris", t, DASH_T + 0.03) then
+			for k = 1, 6 do
+				Kit.spray(ctx, debris, ground + fwd * (k * 3.5) * S, 4, ColorSequence.new(Kit.pal(h + k * 0.08).debris), "point", 0, 0,
+					(Vector3.yAxis * 1.6 + right * (if k % 2 == 0 then 1 else -1) * 0.6).Unit)
+			end
+		end
+		-- ground scar: glows hot, cools to ink, fades
+		local tg = t - (DASH_T + 0.02)
+		if tg >= 0 then
+			local p0 = ground + fwd * 1 * S + Vector3.yAxis * 0.08
+			local len = 24 * S * Kit.easeOut(tg / 0.06)
+			scarA0.CFrame = CFrame.fromMatrix(p0, fwd, right)
+			scarA1.CFrame = CFrame.fromMatrix(p0 + fwd * len, fwd, right)
+			scar.Enabled = true
+			scar.Width0, scar.Width1 = 0.6 * S, 1.6 * S
+			local cool = Kit.ramp(tg, 0.15, 0.9)
+			scar.Brightness = 5 * (1 - cool) + 0.5
+			scar.LightEmission = 1 - cool
+			local c0 = Kit.hueSeq(h, 0.9, 0.85, 1, 5)
+			local kps = {}
+			for _, kp in c0.Keypoints do
+				table.insert(kps, ColorSequenceKeypoint.new(kp.Time, kp.Value:Lerp(Kit.ink(h + kp.Time), cool)))
+			end
+			scar.Color = ColorSequence.new(kps)
+			scar.Transparency = NumberSequence.new(Kit.ramp(tg, 0.7, 1.2))
+		else
+			scar.Enabled = false
+		end
+		-- one light: charge glow, hard kick on the cut, following the caster
+		lightHost.CFrame = CFrame.new(casterPos + Vector3.yAxis * 2 * S)
+		light.Brightness = 3 * (1 - Kit.ramp(t, 0.05, 0.3)) + 1.5 * Kit.ramp(t, 0.4, DASH_T) * (if t < DASH_T then 1 else 0)
+			+ (if t >= DASH_T then 7 * math.exp(-(t - DASH_T) * 6) else 0)
+		light.Color = Kit.col(h, 0.4, 1)
+	end
+end
+
+function PrismCleave.shake(t: number): Vector3
+	local a = 0.2 * math.exp(-t * 12) + 0.06 * (if t > 0.4 and t < 0.86 then 1 else 0)
+		+ (if t >= 0.86 then 0.9 * math.exp(-(t - 0.86) * 7) else 0)
+	return Vector3.new(math.sin(t * 95) * a, math.sin(t * 73 + 1) * a * 0.7, math.sin(t * 61) * a * 0.3)
+end
+
+return PrismCleave
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="10">
+          <Properties>
+            <string name="Name">StormLance</string>
+            <string name="Source"><![CDATA[--!strict
+--[[ StormLance: a stab calls the sky down three times.
+	0.00-0.30  the caster (optional) lunges into a stab toward the target; the scene darkens to a deep indigo grade
+	0.30       STRIKE 1:
+	           - white-out flash, then a thick white-hot energy pillar slams down from the sky onto the target;
+	           - its halo runs the rainbow along its height;
+	           - thin rainbow zigzag bolts crawl round it;
+	           - ground flash, shock ring, sparks, radial ground forks.
+	0.78       STRIKE 2, hue shifted a third of the wheel
+	1.18       STRIKE 3, the biggest: wider pillar, more bolts, scorch crack and static that linger
+	1.50-2.00  static arcs thin out, the crack cools to ink, the grade lifts
+	The pillar is camera-facing Beams: a white core (Brightness 8) and a rainbow halo, with width flicker on
+	0.035 s slots. The bolts are jagged polylines reseeded per slot from a fixed seed, so frozen frames repeat.
+	cf = the target point on the ground. opts.caster = R15 model, posed and placed ~8 studs back facing the target
+	(optional). opts.grade = false skips the scene grade. Life 2.0 s. ]]
+local Workspace = game:GetService("Workspace")
+local Kit = require(script.Parent.Parent.Kit)
+local Pose = require(script.Parent.Parent.Pose)
+
+local StormLance = {}
+StormLance.life = 2.0
+StormLance.required = { "bolt_glow", "glow_soft", "shock_ring", "ground_crack", "spark_streak", "spark_glint", "smoke_puff" }
+
+local A, arm = Pose.A, Pose.arm
+local KEYS: { Pose.Key } = {
+	{ t = 0, p = {} },
+	{ t = 0.12, p = { -- draw back
+		Root = CFrame.new(0, -0.4, 0) * A(0, 25, 0), Waist = A(0, 20, 0),
+		RightShoulder = arm(40, -40, 30), RightElbow = A(70, 0, 0), LeftShoulder = arm(60, -10, 0),
+		RightHip = A(25, 0, 0), RightKnee = A(-35, 0, 0), LeftHip = A(10, 0, 0), LeftKnee = A(-15, 0, 0) } },
+	{ t = 0.24, p = { -- STAB: lunge, blade arm straight at the target
+		Root = CFrame.new(0, -0.9, 0) * A(-14, -12, 0), Waist = A(-6, -10, 0), Neck = A(6, 10, 0),
+		RightShoulder = arm(92, 8, 0), RightElbow = A(2, 0, 0), LeftShoulder = arm(-20, 0, -40),
+		RightHip = A(70, 0, 0), RightKnee = A(-70, 0, 0), LeftHip = A(-30, 0, 0), LeftKnee = A(-25, 0, 0) } },
+	{ t = 1.55, p = "SAME" :: any },
+	{ t = 2.0, p = {} },
+}
+KEYS[4].p = KEYS[3].p
+
+type Bolt = { base: { Vector3 }, amp: { number }, atts: { Attachment }, core: { Beam }, glow: { Beam }, width: number }
+type Strike = { t: number, hue: number, scale: number, bolts: { Bolt }, forks: { Bolt } }
+local STRIKES = { { t = 0.3, hue = 0.0, scale = 1.0 }, { t = 0.78, hue = 0.33, scale = 1.0 }, { t = 1.18, hue = 0.66, scale = 1.35 } }
+
+function StormLance.build(ctx: Kit.Ctx): (number) -> ()
+	local S = ctx.opts.scale
+	local rng = ctx.rng
+	local params = RaycastParams.new()
+	local ex: { Instance } = { ctx.root }
+	if ctx.opts.caster then
+		table.insert(ex, ctx.opts.caster)
+	end
+	params.FilterDescendantsInstances = ex
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local hit = Workspace:Raycast(ctx.cf.Position + Vector3.new(0, 6, 0), Vector3.new(0, -16, 0), params)
+	local gy = if hit then hit.Position.Y else ctx.cf.Position.Y
+	local c = Vector3.new(ctx.cf.X, gy, ctx.cf.Z)
+	local once = Kit.once()
+	local grade = Kit.grade(ctx)
+	local rig = Pose.rig(ctx, ctx.opts.caster)
+	if rig and rig.root0 then
+		-- face the target
+		local p = rig.root0.Position
+		local look = (c - p) * Vector3.new(1, 0, 1)
+		if look.Magnitude > 1e-3 then
+			rig.root0 = CFrame.lookAt(p, p + look.Unit)
+		end
+	end
+
+	local function newBolt(pts: { Vector3 }, amps: { number }, width: number): Bolt
+		local b: Bolt = { base = pts, amp = amps, atts = {}, core = {}, glow = {}, width = width }
+		for i = 1, #pts do
+			b.atts[i] = Kit.att(ctx, CFrame.new(pts[i]))
+		end
+		for i = 1, #pts - 1 do
+			local g = Kit.beam(ctx, b.atts[i], b.atts[i + 1], "bolt_glow", 0)
+			g.Segments = 1
+			g.Brightness = 3
+			local k = Kit.beam(ctx, b.atts[i], b.atts[i + 1], "bolt_glow", 1)
+			k.Segments = 1
+			k.Brightness = 7
+			b.glow[i], b.core[i] = g, k
+		end
+		return b
+	end
+	local function line(a: Vector3, b: Vector3, n: number, amp: number, flatY: number?): ({ Vector3 }, { number })
+		local pts, amps = {}, {}
+		local dir = b - a
+		local p1 = dir:Cross(Vector3.new(0.3, 1, 0.2)).Unit
+		local p2 = dir:Cross(p1).Unit
+		for i = 0, n - 1 do
+			local f = i / (n - 1)
+			local env = math.sin(math.pi * f) ^ 0.6
+			local p = a + dir * f + (p1 * rng:NextNumber(-1, 1) + p2 * rng:NextNumber(-1, 1)) * amp * env
+			if flatY then
+				p = Vector3.new(p.X, flatY, p.Z)
+			end
+			pts[i + 1] = p
+			amps[i + 1] = amp * 0.45 * env
+		end
+		return pts, amps
+	end
+
+	-- per strike: a pillar (two-beam column), zigzag bolts round it, ground forks
+	type Pillar = { a0: Attachment, a1: Attachment, am: Attachment, core: { Beam }, halo: { Beam } }
+	local pillars: { Pillar } = {}
+	local strikes: { Strike } = {}
+	for si, sd in STRIKES do
+		local a0, am, a1 = Kit.att(ctx), Kit.att(ctx), Kit.att(ctx)
+		local core, halo = {}, {}
+		for k, pair in { { a0, am }, { am, a1 } } do
+			local h = Kit.beam(ctx, pair[1], pair[2], "bolt_glow", 0)
+			h.Segments = 1
+			h.Brightness = 3.5
+			h.Name = "PillarHalo" .. si
+			local cr = Kit.beam(ctx, pair[1], pair[2], "bolt_glow", 2)
+			cr.Segments = 1
+			cr.Brightness = 9
+			cr.Name = "PillarCore" .. si
+			halo[k], core[k] = h, cr
+		end
+		table.insert(pillars, { a0 = a0, a1 = a1, am = am, core = core, halo = halo })
+		local bolts, forks = {}, {}
+		local nb = if sd.scale > 1 then 7 else 5
+		for k = 1, nb do
+			local ang = k / nb * math.pi * 2 + rng:NextNumber(-0.3, 0.3)
+			local r0 = rng:NextNumber(0.8, 2.2) * S
+			local top = c + Vector3.new(math.cos(ang) * r0, rng:NextNumber(14, 26) * S, math.sin(ang) * r0)
+			local ang2 = ang + rng:NextNumber(-1.2, 1.2)
+			local bot = c + Vector3.new(math.cos(ang2) * rng:NextNumber(1, 3.5) * S, 0.2, math.sin(ang2) * rng:NextNumber(1, 3.5) * S)
+			local p, a = line(top, bot, 12, 1.6 * S)
+			table.insert(bolts, newBolt(p, a, 0.32 * sd.scale))
+		end
+		for k = 1, 6 do
+			local ang = k / 6 * math.pi * 2 + rng:NextNumber(-0.25, 0.25)
+			local d = Vector3.new(math.cos(ang), 0, math.sin(ang))
+			local p, a = line(c + d * 0.8 * S, c + d * rng:NextNumber(5, 8.5) * sd.scale * S, 7, 0.9 * S, gy + 0.15)
+			table.insert(forks, newBolt(p, a, 0.4 * sd.scale))
+		end
+		table.insert(strikes, { t = sd.t, hue = sd.hue, scale = sd.scale, bolts = bolts, forks = forks })
+	end
+	-- lingering static arcs after the last strike
+	local statics: { Bolt } = {}
+	for _ = 1, 8 do
+		local pts, amps = {}, {}
+		for i = 1, 5 do
+			pts[i] = c
+			amps[i] = 0
+		end
+		table.insert(statics, newBolt(pts, amps, 0.22))
+	end
+
+	local whiteout = Kit.burst(ctx, "WhiteOut", { tex = "glow_soft", life = { 0.12 }, size = { { 0, 14 }, { 0.3, 34 }, { 1, 38 } },
+		transp = { { 0, 0.05 }, { 0.5, 0.4 }, { 1, 1 } }, bright = 3, zoff = 6 })
+	local groundGlows, rings = {}, {}
+	for si = 1, 3 do
+		groundGlows[si] = Kit.flat(ctx, "GroundGlow", { tex = "glow_soft", life = 0.35, size = { { 0, 6 }, { 0.2, 14 }, { 1, 16 } },
+			transp = { { 0, 0 }, { 0.5, 0.4 }, { 1, 1 } }, bright = 3 })
+		rings[si] = Kit.flat(ctx, "ShockRing", { tex = "shock_ring", life = 0.4, size = { { 0, 2 }, { 0.15, 12 }, { 0.5, 18 }, { 1, 20 } },
+			transp = { { 0, 0 }, { 0.5, 0.3 }, { 1, 1 } }, rot = si * 70, spin = 40, bright = 2.5, z = 1 })
+	end
+	local crackDark = Kit.flat(ctx, "CrackDark", { tex = "ground_crack", life = 1.0, size = { { 0, 4 }, { 0.1, 13 }, { 1, 14 } },
+		transp = { { 0, 0 }, { 0.8, 0.15 }, { 1, 1 } }, rot = 25, le = 0, z = -1 })
+	local crackHot = Kit.flat(ctx, "CrackHot", { tex = "ground_crack", life = 0.75, size = { { 0, 4 }, { 0.12, 13 }, { 1, 14 } },
+		transp = { { 0, 0 }, { 0.35, 0.3 }, { 1, 1 } }, rot = 25, bright = 3 })
+	local sparks = Kit.burst(ctx, "Sparks", { tex = "spark_streak", life = { 0.2, 0.45 }, size = { { 0, 0.8 }, { 1, 0 } },
+		speed = { 30, 60 }, spread = 70, drag = 5, acc = Vector3.new(0, -35, 0), vpar = true, bright = 5 })
+	local glints = Kit.burst(ctx, "Glints", { tex = "spark_glint", life = { 0.16, 0.26 }, size = { { 0, 0 }, { 0.2, 2.6 }, { 1, 0 } },
+		speed = { 0.3, 1 }, spread = 180, bright = 6, zoff = 2 })
+	local smoke = Kit.burst(ctx, "Smoke", { tex = "smoke_puff", life = { 0.9, 1.3 }, size = { { 0, 2 }, { 1, 5.5 } },
+		transp = { { 0, 1 }, { 0.2, 0.72 }, { 0.6, 0.8 }, { 1, 1 } }, speed = { 1.5, 3.5 }, spread = 40, drag = 1.2,
+		acc = Vector3.new(0, 1.2, 0), rot = { 0, 360 }, rotSpeed = { -25, 25 }, le = 0 })
+	local lightHost = Kit.part(ctx, ctx.root, "LightHost", Vector3.one * 0.2, Color3.new(), Enum.Material.SmoothPlastic)
+	lightHost.Transparency = 1
+	lightHost.CFrame = CFrame.new(c + Vector3.new(0, 4 * S, 0))
+	local light = Kit.light(ctx, lightHost, 30 * S)
+
+	local SLOT = 0.035
+	local function setBolt(b: Bolt, vis: number, hue: number, sr: Random, headN: number?)
+		for i = 1, #b.base do
+			local j = if b.amp[i] > 0 then Vector3.new(sr:NextNumber(-1, 1), sr:NextNumber(-1, 1), sr:NextNumber(-1, 1)) * b.amp[i] else Vector3.zero
+			b.atts[i].CFrame = CFrame.new(b.base[i] + j)
+		end
+		for i = 1, #b.core do
+			local on = vis > 0.02 and i < (headN or 999)
+			b.core[i].Enabled, b.glow[i].Enabled = on, on
+			if on then
+				local w = b.width * S * (0.6 + 0.4 * vis)
+				b.core[i].Width0, b.core[i].Width1 = w * 0.4, w * 0.4
+				b.glow[i].Width0, b.glow[i].Width1 = w * 2.6, w * 2.6
+				b.core[i].Color = ColorSequence.new(Kit.hot(hue))
+				b.glow[i].Color = ColorSequence.new(Kit.col(hue + i * 0.02, 0.85, 1))
+				b.core[i].Transparency = NumberSequence.new(1 - vis)
+				b.glow[i].Transparency = NumberSequence.new(1 - vis * 0.8)
+			end
+		end
+	end
+
+	return function(t: number)
+		local sr = Kit.slotRng(ctx.opts.seed, t, SLOT)
+		local slot = math.floor(t / SLOT)
+		local h0 = Kit.hue(ctx, t, 0)
+		if rig then
+			rig.apply(Pose.sample(KEYS, t))
+			if rig.root0 then
+				rig.move(rig.root0)
+			end
+		end
+		-- scene grade: sink to indigo, white-out pops on each strike, lift at the end
+		local dark = Kit.ramp(t, 0.05, 0.28) * (1 - Kit.ramp(t, 1.6, 2.0))
+		local pop = 0
+		for _, st in strikes do
+			local d = t - st.t
+			if d >= -0.03 and d < 0.1 then
+				pop = math.max(pop, 1 - math.abs(d + 0.0) / 0.1)
+			end
+		end
+		if grade then
+			grade.TintColor = Color3.new(1, 1, 1):Lerp(Color3.fromRGB(150, 120, 255), dark)
+			grade.Brightness = -0.22 * dark + 0.55 * pop
+			grade.Contrast = 0.25 * dark
+			grade.Saturation = 0.2 * dark - 0.5 * pop
+		end
+
+		local lb = 0
+		for si, st in strikes do
+			local d = t - st.t
+			local P = pillars[si]
+			local hue = h0 + st.hue
+			-- pillar: slams down in 0.03 s, holds with flicker, thins and fades by 0.3 s
+			local on = if d >= 0 and d < 0.32 then (1 - Kit.ramp(d, 0.14, 0.32)) else 0
+			if on > 0 then
+				local slam = Kit.easeOut(d / 0.03)
+				local top = c + Vector3.yAxis * 45 * S
+				local bottom = top:Lerp(c, slam)
+				local flick = if sr:NextNumber() > 0.25 then 1 else 0.7
+				local W = (1.7 + 0.5 * flick) * S * st.scale * (0.5 + 0.5 * on)
+				P.a0.CFrame = CFrame.new(top)
+				P.am.CFrame = CFrame.new(top:Lerp(bottom, 0.6))
+				P.a1.CFrame = CFrame.new(bottom)
+				for k = 1, 2 do
+					P.core[k].Enabled, P.halo[k].Enabled = true, true
+					P.core[k].Width0 = W * (if k == 1 then 0.5 else 0.75)
+					P.core[k].Width1 = W * (if k == 1 then 0.75 else 1.0)
+					P.halo[k].Width0 = W * (if k == 1 then 2.2 else 3.2)
+					P.halo[k].Width1 = W * (if k == 1 then 3.2 else 4.2)
+					P.core[k].Color = ColorSequence.new(Kit.hot(hue))
+					P.halo[k].Color = Kit.hueSeq(hue + (k - 1) * 0.3, 0.3, 0.75, 1, 3)
+					P.core[k].Transparency = NumberSequence.new(1 - on)
+					P.halo[k].Transparency = NumberSequence.new(1 - on * 0.75)
+				end
+			else
+				for k = 1, 2 do
+					P.core[k].Enabled, P.halo[k].Enabled = false, false
+				end
+			end
+			-- zigzag bolts round the pillar (staggered, flickering)
+			for bi, b in st.bolts do
+				local bd = d - bi * 0.012
+				local vis = if bd >= 0 and bd < 0.3 then (if sr:NextNumber() > 0.3 then 1 else 0.35) * (1 - Kit.ramp(bd, 0.15, 0.3)) else 0
+				setBolt(b, vis, hue + bi * 0.09, sr, nil)
+			end
+			-- ground forks crawl outward
+			for fi, b in st.forks do
+				local fd = d - 0.02
+				local vis = if fd >= 0 and fd < 0.4 then (if sr:NextNumber() > 0.25 then 1 else 0.4) * (1 - Kit.ramp(fd, 0.2, 0.4)) else 0
+				local headN = math.max(2, math.ceil(#b.base * Kit.easeOut(fd / 0.08)))
+				setBolt(b, vis, hue + fi / 6, sr, headN)
+			end
+			-- impact layers
+			if once("hit" .. si, d, 0) then
+				Kit.spray(ctx, whiteout, c + Vector3.yAxis * 4 * S, 1, ColorSequence.new(Kit.hot(hue)), "point")
+				groundGlows[si].fire(st.t, c + Vector3.yAxis * 0.12, ColorSequence.new(Kit.col(hue, 0.6, 1)))
+				rings[si].fire(st.t, c + Vector3.yAxis * 0.14, ColorSequence.new(Kit.col(hue + 0.1, 0.7, 1)))
+				Kit.spray(ctx, sparks, c + Vector3.yAxis * 0.5, math.floor(22 * st.scale), Kit.hueSeq(hue, 0.5, 0.5, 1, 3), "point")
+				Kit.spray(ctx, glints, c + Vector3.yAxis * 2 * S, 4, ColorSequence.new(Kit.hot(hue)), "sphere", 3.5)
+			end
+			groundGlows[si].update(t)
+			rings[si].update(t)
+			if d >= 0 then
+				lb = math.max(lb, 9 * st.scale * math.exp(-d * 9))
+			end
+		end
+		-- the last strike leaves a scorch crack, static and smoke
+		local tl = t - STRIKES[3].t
+		if once("scorch", tl, 0.01) then
+			local hue = h0 + STRIKES[3].hue
+			crackDark.fire(STRIKES[3].t + 0.01, c + Vector3.yAxis * 0.06, ColorSequence.new(Kit.ink(hue)))
+			crackHot.fire(STRIKES[3].t + 0.01, c + Vector3.yAxis * 0.1, Kit.hueSeq(hue, 0.6, 0.7, 1, 3))
+		end
+		crackDark.update(t)
+		crackHot.update(t)
+		if once("smoke", tl, 0.12) then
+			Kit.spray(ctx, smoke, c + Vector3.yAxis * 0.8, 7, ColorSequence.new(Color3.fromRGB(60, 54, 80)), "disc", 2.5, 1.5)
+		end
+		local nStatic = math.floor(8 * (1 - Kit.ramp(tl, 0.25, 0.8)) + 0.5)
+		for si, b in statics do
+			if tl >= 0.1 and si <= nStatic then
+				local ang = sr:NextNumber(0, math.pi * 2)
+				local rad = sr:NextNumber(0.8, 5.5) * S
+				local p0 = c + Vector3.new(math.cos(ang) * rad, 0.15 + sr:NextNumber(0, 1), math.sin(ang) * rad)
+				local dir = Vector3.new(sr:NextNumber(-1, 1), sr:NextNumber(-0.2, 0.7), sr:NextNumber(-1, 1)).Unit * sr:NextNumber(1.2, 2.8) * S
+				for i = 1, 5 do
+					b.base[i] = p0 + dir * ((i - 1) / 4)
+					b.amp[i] = if i == 1 or i == 5 then 0 else 0.4 * S
+				end
+				setBolt(b, if sr:NextNumber() > 0.3 then 0.85 else 0, h0 + si / 8, sr, nil)
+			else
+				setBolt(b, 0, 0, sr, nil)
+			end
+		end
+		light.Brightness = lb + (if slot % 2 == 0 then 0.6 else 0.3) * (1 - Kit.ramp(tl, 0.2, 0.7)) * (if tl > 0 then 1 else 0)
+		light.Color = Kit.col(h0, 0.45, 1)
+	end
+end
+
+function StormLance.shake(t: number): Vector3
+	local a = 0
+	for _, s in STRIKES do
+		if t >= s.t then
+			a = math.max(a, 0.55 * s.scale * math.exp(-(t - s.t) * 10))
+		end
+	end
+	return Vector3.new(math.sin(t * 97) * a, math.sin(t * 71 + 2) * a * 0.7, 0)
+end
+
+return StormLance
+]]></string>
+          </Properties>
+        </Item>
+      </Item>
+      <Item class="ModuleScript" referent="11">
+        <Properties>
+          <string name="Name">Kit</string>
+          <string name="Source"><![CDATA[--!strict
+-- wakuVFX Kit: the building blocks every effect uses (parts, beams on a world rig, particle bursts, ground cards,
+-- lights) plus the rainbow palette and small easing helpers. Every part is Anchored, never collides, queries,
+-- touches or casts a shadow.
+local Kit = {}
+
+Kit.missing = {} :: { [string]: number }
+
+export type Opts = { rainbow: boolean, hue: number, scale: number, caster: Model?, seed: number, grade: boolean? }
+export type Ctx = {
+	root: Model,
+	cf: CFrame,
+	opts: Opts,
+	assets: { [string]: string },
+	rng: Random,
+	emitters: { ParticleEmitter },
+	cleanups: { () -> () },
+	rig: Part,
+	host: Part,
+}
+
+Kit.HIDE = CFrame.new(0, -5000, 0)
+
+function Kit.newCtx(root: Model, cf: CFrame, assets: { [string]: string }, opts: Opts): Ctx
+	local ctx: Ctx = {
+		root = root,
+		cf = cf,
+		opts = opts,
+		assets = assets,
+		rng = Random.new(opts.seed),
+		emitters = {},
+		cleanups = {},
+		rig = nil :: any,
+		host = nil :: any,
+	}
+	-- attachments for beams live on one invisible part at the world origin, so Attachment.CFrame = world CFrame
+	ctx.rig = Kit.part(ctx, root, "Rig", Vector3.one * 0.2, Color3.new(), Enum.Material.SmoothPlastic)
+	ctx.rig.Transparency = 1
+	ctx.rig.CFrame = CFrame.identity
+	ctx.host = Kit.part(ctx, root, "EmitHost", Vector3.one * 0.2, Color3.new(), Enum.Material.SmoothPlastic)
+	ctx.host.Transparency = 1
+	return ctx
+end
+
+function Kit.tex(ctx: Ctx, key: string): string
+	local id = ctx.assets[key]
+	if id == nil or id == "" then
+		Kit.missing[key] = (Kit.missing[key] or 0) + 1
+		return ""
+	end
+	return id
+end
+
+-- maths ------------------------------------------------------------------------------------------------------
+function Kit.clamp01(x: number): number
+	return math.clamp(x, 0, 1)
+end
+function Kit.smooth(x: number): number
+	x = math.clamp(x, 0, 1)
+	return x * x * (3 - 2 * x)
+end
+function Kit.easeOut(x: number): number
+	x = math.clamp(x, 0, 1)
+	return 1 - (1 - x) ^ 3
+end
+function Kit.easeIn(x: number): number
+	x = math.clamp(x, 0, 1)
+	return x * x
+end
+function Kit.easeOutBack(x: number): number
+	x = math.clamp(x, 0, 1)
+	local c = 1.9
+	return 1 + (c + 1) * (x - 1) ^ 3 + c * (x - 1) ^ 2
+end
+-- 0 before a, ramps to 1 by b
+function Kit.ramp(t: number, a: number, b: number): number
+	return math.clamp((t - a) / (b - a), 0, 1)
+end
+
+-- palette ----------------------------------------------------------------------------------------------------
+-- hue for a layer: rainbow mode cycles with time; noncycling mode offsets opts.hue; effect layers can still add a full spatial rainbow
+function Kit.hue(ctx: Ctx, t: number, phase: number): number
+	if ctx.opts.rainbow then
+		return (ctx.opts.hue + t * 0.6 + phase) % 1
+	end
+	return (ctx.opts.hue + phase * 0.06) % 1
+end
+function Kit.col(h: number, s: number?, v: number?): Color3
+	return Color3.fromHSV(h % 1, s or 0.9, v or 1)
+end
+-- hot core: near white with a faint tint of the hue
+function Kit.hot(h: number): Color3
+	return Color3.fromHSV(h % 1, 0.14, 1)
+end
+-- dark ink: deep, saturated, opposite the body hue for contrast
+function Kit.ink(h: number): Color3
+	return Color3.fromHSV((h + 0.5) % 1, 0.85, 0.28)
+end
+-- a hue run along a sequence (beam length, particle life)
+function Kit.hueSeq(h0: number, span: number, s: number?, v: number?, n: number?): ColorSequence
+	local k = n or 4
+	local kps = {}
+	for i = 0, k - 1 do
+		local f = i / (k - 1)
+		table.insert(kps, ColorSequenceKeypoint.new(f, Color3.fromHSV((h0 + span * f) % 1, s or 0.9, v or 1)))
+	end
+	return ColorSequence.new(kps)
+end
+
+-- instances --------------------------------------------------------------------------------------------------
+function Kit.part(_: Ctx?, parent: Instance, name: string, size: Vector3, color: Color3, mat: Enum.Material): Part
+	local p = Instance.new("Part")
+	p.Name = name
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanQuery = false
+	p.CanTouch = false
+	p.CastShadow = false
+	p.Size = size
+	p.Color = color
+	p.Material = mat
+	p.TopSurface = Enum.SurfaceType.Smooth
+	p.BottomSurface = Enum.SurfaceType.Smooth
+	p.CFrame = Kit.HIDE
+	p.Parent = parent
+	return p
+end
+
+function Kit.wedge(parent: Instance, name: string, size: Vector3, color: Color3, mat: Enum.Material, corner: boolean?): BasePart
+	local p: BasePart = if corner then Instance.new("CornerWedgePart") else Instance.new("WedgePart")
+	p.Name = name
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanQuery = false
+	p.CanTouch = false
+	p.CastShadow = false
+	p.Size = size
+	p.Color = color
+	p.Material = mat
+	p.CFrame = Kit.HIDE
+	p.Parent = parent
+	return p
+end
+
+function Kit.att(ctx: Ctx, cf: CFrame?): Attachment
+	local a = Instance.new("Attachment")
+	a.CFrame = cf or Kit.HIDE
+	a.Parent = ctx.rig
+	return a
+end
+
+-- a camera-facing ribbon between two rig attachments
+function Kit.beam(ctx: Ctx, a0: Attachment, a1: Attachment, texKey: string?, z: number?): Beam
+	local b = Instance.new("Beam")
+	b.Attachment0 = a0
+	b.Attachment1 = a1
+	b.FaceCamera = true
+	b.Segments = 12
+	b.LightEmission = 1
+	b.LightInfluence = 0
+	b.TextureMode = Enum.TextureMode.Stretch
+	b.TextureLength = 1
+	b.TextureSpeed = 0
+	b.ZOffset = z or 0
+	if texKey then
+		b.Texture = Kit.tex(ctx, texKey)
+	end
+	b.Parent = ctx.rig
+	return b
+end
+
+-- particle burst source: emitters sit on one hidden host part that is moved to each burst point
+function Kit.emitter(ctx: Ctx, name: string, texKey: string): ParticleEmitter
+	local e = Instance.new("ParticleEmitter")
+	e.Name = name
+	e.Enabled = false
+	e.Texture = Kit.tex(ctx, texKey)
+	e.LightInfluence = 0
+	e.LockedToPart = false
+	e.Parent = ctx.host
+	table.insert(ctx.emitters, e)
+	return e
+end
+function Kit.emit(ctx: Ctx, e: ParticleEmitter, at: CFrame, n: number)
+	ctx.host.CFrame = at
+	e:Emit(math.max(1, math.floor(n + 0.5)))
+end
+
+-- flat ground card with a top-face decal (shock rings, cracks, frost)
+function Kit.card(ctx: Ctx, name: string, texKey: string): (Part, Decal)
+	local p = Kit.part(ctx, ctx.root, name, Vector3.new(1, 0.05, 1), Color3.new(), Enum.Material.SmoothPlastic)
+	p.Transparency = 1
+	local d = Instance.new("Decal")
+	d.Face = Enum.NormalId.Top
+	d.Texture = Kit.tex(ctx, texKey)
+	d.Parent = p
+	return p, d
+end
+
+function Kit.light(ctx: Ctx, parent: BasePart, range: number): PointLight
+	local l = Instance.new("PointLight")
+	l.Range = range
+	l.Brightness = 0
+	l.Shadows = false
+	l.Parent = parent
+	return l
+end
+
+-- deterministic per-slot random (frozen frames repeat exactly)
+function Kit.slotRng(seed: number, t: number, period: number): Random
+	return Random.new(seed * 7919 + math.floor(t / period))
+end
+
+-- fires once when t first passes `at`
+function Kit.once(): (string, number, number) -> boolean
+	local fired: { [string]: boolean } = {}
+	return function(key: string, t: number, at: number): boolean
+		if not fired[key] and t >= at then
+			fired[key] = true
+			return true
+		end
+		return false
+	end
+end
+
+-- NumberSequence from (time, value) pairs, sorted, clamped to 0..1 and to the 20-keypoint limit
+function Kit.numSeq(pts: { { number } }): NumberSequence
+	table.sort(pts, function(a, b)
+		return a[1] < b[1]
+	end)
+	local kps = {}
+	local last = -1
+	for _, p in pts do
+		local x = math.clamp(p[1], 0, 1)
+		if x > last + 1e-4 and #kps < 18 then
+			table.insert(kps, NumberSequenceKeypoint.new(x, math.clamp(p[2], 0, 1)))
+			last = x
+		end
+	end
+	if #kps == 0 or kps[1].Time > 0 then
+		table.insert(kps, 1, NumberSequenceKeypoint.new(0, if #kps > 0 then kps[1].Value else 1))
+	end
+	if kps[#kps].Time < 1 then
+		if #kps >= 20 then
+			kps[#kps] = NumberSequenceKeypoint.new(1, kps[#kps].Value)
+		else
+			table.insert(kps, NumberSequenceKeypoint.new(1, kps[#kps].Value))
+		end
+	end
+	return NumberSequence.new(kps)
+end
+
+-- palette roles for one hue (rainbow body, white-hot core, deep ink, glow, pale spark, dark debris)
+export type Pal = { main: Color3, hot: Color3, dark: Color3, glow: Color3, spark: Color3, debris: Color3 }
+function Kit.pal(h: number): Pal
+	return {
+		main = Color3.fromHSV(h % 1, 0.82, 1),
+		hot = Color3.fromHSV(h % 1, 0.1, 1),
+		dark = Color3.fromHSV((h + 0.5) % 1, 0.85, 0.22),
+		glow = Color3.fromHSV((h + 0.07) % 1, 0.7, 1),
+		spark = Color3.fromHSV((h + 0.03) % 1, 0.35, 1),
+		debris = Color3.fromHSV((h + 0.5) % 1, 0.6, 0.12),
+	}
+end
+
+-- NumberSequence from { {t, v}, ... } keypoints (sizes/transparencies over a particle's life)
+function Kit.curve(pts: { { number } }): NumberSequence
+	local kps = {}
+	for _, p in pts do
+		table.insert(kps, NumberSequenceKeypoint.new(p[1], p[2]))
+	end
+	if kps[1].Time > 0 then
+		table.insert(kps, 1, NumberSequenceKeypoint.new(0, kps[1].Value))
+	end
+	if kps[#kps].Time < 1 then
+		table.insert(kps, NumberSequenceKeypoint.new(1, kps[#kps].Value))
+	end
+	return NumberSequence.new(kps)
+end
+
+export type BurstSpec = {
+	tex: string,
+	life: { number },
+	size: { { number } },
+	transp: { { number } }?,
+	speed: { number }?,
+	spread: number?,
+	drag: number?,
+	acc: Vector3?,
+	rot: { number }?,
+	rotSpeed: { number }?,
+	le: number?,
+	bright: number?,
+	zoff: number?,
+	flat: boolean?, -- lies flat on the ground (VelocityPerpendicular, emitted straight up at ~0 speed)
+	vpar: boolean?, -- streaks along the velocity
+}
+-- a configured emitter for one burst layer (color is set per emission)
+function Kit.burst(ctx: Ctx, name: string, b: BurstSpec): ParticleEmitter
+	local e = Kit.emitter(ctx, name, b.tex)
+	local S = ctx.opts.scale
+	local sz = {}
+	for _, p in b.size do
+		table.insert(sz, { p[1], p[2] * S })
+	end
+	e.Size = Kit.curve(sz)
+	e.Transparency = if b.transp then Kit.curve(b.transp) else NumberSequence.new(0)
+	e.Lifetime = NumberRange.new(b.life[1], b.life[2] or b.life[1])
+	if b.flat then
+		e.Orientation = Enum.ParticleOrientation.VelocityPerpendicular
+		e.Speed = NumberRange.new(0.05) -- a real (tiny) velocity, so the flat orientation is always defined
+		e.SpreadAngle = Vector2.zero
+	else
+		local sp = b.speed or { 0, 0 }
+		e.Speed = NumberRange.new(sp[1] * S, (sp[2] or sp[1]) * S)
+		e.SpreadAngle = Vector2.new(b.spread or 0, b.spread or 0)
+		if b.vpar then
+			e.Orientation = Enum.ParticleOrientation.VelocityParallel
+		end
+	end
+	e.Drag = b.drag or 0
+	e.Acceleration = b.acc or Vector3.zero
+	if b.rot then
+		e.Rotation = NumberRange.new(b.rot[1], b.rot[2] or b.rot[1])
+	end
+	if b.rotSpeed then
+		e.RotSpeed = NumberRange.new(b.rotSpeed[1], b.rotSpeed[2])
+	end
+	e.LightEmission = b.le or 1
+	e.Brightness = b.bright or 1
+	e.ZOffset = b.zoff or 0
+	return e
+end
+
+-- CFrame at p whose UpVector (an emitter's Top face) is d; safe for d straight up or down
+function Kit.upTo(p: Vector3, d: Vector3): CFrame
+	local u = if d.Magnitude > 1e-6 then d.Unit else Vector3.yAxis
+	local r = u:Cross(Vector3.zAxis)
+	if r.Magnitude < 1e-3 then
+		r = u:Cross(Vector3.xAxis)
+	end
+	return CFrame.fromMatrix(p, r.Unit, u)
+end
+
+-- emit n particles at pos. mode: "point" (emitter's own spread, pointing `dir`), "disc" (outward round the ground,
+-- `up` = rise), "sphere" (all directions) ; radius = random start offset.
+function Kit.spray(ctx: Ctx, e: ParticleEmitter, pos: Vector3, n: number, color: ColorSequence, mode: string?, radius: number?, up: number?, dir: Vector3?)
+	e.Color = color
+	local m = mode or "point"
+	local r = (radius or 0) * ctx.opts.scale
+	local rng = ctx.rng
+	if m == "point" then
+		ctx.host.CFrame = Kit.upTo(pos, dir or Vector3.yAxis)
+		e:Emit(n)
+		return
+	end
+	for _ = 1, n do
+		local a = rng:NextNumber(0, math.pi * 2)
+		local off = Vector3.new(math.cos(a), 0, math.sin(a))
+		local d: Vector3
+		if m == "disc" then
+			d = (off + Vector3.new(0, up or 0, 0)).Unit
+		else
+			d = Vector3.new(rng:NextNumber(-1, 1), rng:NextNumber(-1, 1), rng:NextNumber(-1, 1))
+			d = if d.Magnitude > 1e-3 then d.Unit else Vector3.yAxis
+		end
+		local p = pos + off * rng:NextNumber(0, 1) * r
+		ctx.host.CFrame = Kit.upTo(p, d)
+		e:Emit(1)
+	end
+end
+
+-- temporary client-side scene grade (darken / tint / white-out) owned by one effect; removed by its cleanup.
+-- Effects animate it each frame. opts.grade = false disables it (returns nil).
+local gradeN = 0
+function Kit.grade(ctx: Ctx): ColorCorrectionEffect?
+	if (ctx.opts :: any).grade == false then
+		return nil
+	end
+	gradeN += 1
+	local cc = Instance.new("ColorCorrectionEffect")
+	cc.Name = "wakuVFX_Grade" .. gradeN
+	table.insert(ctx.cleanups, function()
+		cc:Destroy()
+	end)
+	cc.Parent = game:GetService("Lighting")
+	return cc
+end
+
+-- curve value at u (0..1) for { {t, v}, ... } keypoints (linear)
+function Kit.evalCurve(pts: { { number } }, u: number): number
+	if u <= pts[1][1] then
+		return pts[1][2]
+	end
+	for i = 2, #pts do
+		local a, b = pts[i - 1], pts[i]
+		if u <= b[1] then
+			return a[2] + (b[2] - a[2]) * (u - a[1]) / math.max(b[1] - a[1], 1e-6)
+		end
+	end
+	return pts[#pts][2]
+end
+
+-- flat textured card lying on the ground: a Beam whose width runs along the attachments' Y axis, laid
+-- horizontal. Unlike a flat particle it is driven by the effect clock, so it is exact in frozen frames.
+-- fire(t0, pos, color) starts one instance; update(t) animates size / transparency over spec.life.
+export type FlatSpec = { tex: string, life: number, size: { { number } }, transp: { { number } }?, rot: number?,
+	spin: number?, bright: number?, le: number?, z: number? }
+export type Flat = { fire: (number, Vector3, ColorSequence) -> (), update: (number) -> () }
+function Kit.flat(ctx: Ctx, name: string, spec: FlatSpec): Flat
+	local a0, a1 = Kit.att(ctx), Kit.att(ctx)
+	local b = Kit.beam(ctx, a0, a1, spec.tex, spec.z or 0)
+	b.Name = name
+	b.FaceCamera = false
+	b.Segments = 1
+	b.Brightness = spec.bright or 1
+	b.LightEmission = spec.le or 1
+	b.Enabled = false
+	local t0: number? = nil
+	local pos = Vector3.zero
+	return {
+		fire = function(t: number, p: Vector3, color: ColorSequence)
+			t0 = t
+			pos = p
+			b.Color = color
+		end,
+		update = function(t: number)
+			if t0 == nil or t < t0 or t > t0 + spec.life then
+				b.Enabled = false
+				return
+			end
+			local u = (t - t0) / spec.life
+			local size = Kit.evalCurve(spec.size, u) * ctx.opts.scale
+			local r = math.rad((spec.rot or 0) + (spec.spin or 0) * (t - t0))
+			local x = Vector3.new(math.cos(r), 0, math.sin(r))
+			local z = Vector3.new(-math.sin(r), 0, math.cos(r))
+			a0.CFrame = CFrame.fromMatrix(pos - x * size / 2, x, z)
+			a1.CFrame = CFrame.fromMatrix(pos + x * size / 2, x, z)
+			b.Width0, b.Width1 = size, size
+			b.Transparency = NumberSequence.new(if spec.transp then Kit.evalCurve(spec.transp, u) else 0)
+			b.Enabled = true
+		end,
+	}
+end
+
+return Kit
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="12">
+        <Properties>
+          <string name="Name">Pose</string>
+          <string name="Source"><![CDATA[--!strict
+--[[ wakuVFX Pose: procedural R15 posing for effects. Poses a client-local clone of the caster that has no Animator
+	(the Humanoid's Animator would reset Joint.Transform every frame), so no animation asset is needed.
+	- An NPC original is unparented locally for the duration.
+	- A player's character stays in place, so the camera and controls keep working, but it is hidden and anchored
+	  locally.
+	Everything is restored by the cleanup registered on the effect context. Works with Motor6D and AnimationConstraint
+	rigs; AnimationConstraints are set kinematic so Transform is exact.
+
+	  local rig = Pose.rig(ctx, caster)          -- nil when there is no caster
+	  rig.apply(Pose.sample(KEYS, t))            -- KEYS = { { t = 0.1, p = { RightShoulder = Pose.arm(80, 40, 0), ... } }, ... }
+	  rig.move(CFrame)                            -- move the clone's root (dashes); joints follow
+	  rig.fade(0..1)                              -- fade the clone out (1 = invisible) ]]
+local CasterState = require(script.Parent.CasterState)
+local Kit = require(script.Parent.Kit)
+
+local Pose = {}
+
+local R = math.rad
+function Pose.A(x: number, y: number, z: number): CFrame
+	return CFrame.Angles(R(x), R(y), R(z))
+end
+-- yaw after pitch: raise the arm forward first, then swing it inward (mirror yaw/roll for the left arm)
+function Pose.arm(pitch: number, yaw: number, roll: number): CFrame
+	return CFrame.Angles(0, R(yaw), 0) * CFrame.Angles(R(pitch), 0, 0) * CFrame.Angles(0, 0, R(roll))
+end
+
+Pose.JOINTS = { "Root", "Waist", "Neck", "RightShoulder", "LeftShoulder", "RightElbow", "LeftElbow", "RightWrist",
+	"LeftWrist", "RightHip", "LeftHip", "RightKnee", "LeftKnee", "RightAnkle", "LeftAnkle" }
+
+export type Key = { t: number, p: { [string]: CFrame } }
+-- smooth interpolation between keyframes (missing joints = identity)
+function Pose.sample(keys: { Key }, t: number): { [string]: CFrame }
+	local out = {}
+	for i = 1, #keys - 1 do
+		local a, b = keys[i], keys[i + 1]
+		if t <= b.t or i == #keys - 1 then
+			local u = Kit.smooth((t - a.t) / math.max(b.t - a.t, 1e-3))
+			for _, j in Pose.JOINTS do
+				out[j] = (a.p[j] or CFrame.identity):Lerp(b.p[j] or CFrame.identity, u)
+			end
+			return out
+		end
+	end
+	return out
+end
+
+export type Rig = { clone: Model, root: BasePart?, root0: CFrame?, apply: ({ [string]: CFrame }) -> (), move: (CFrame) -> (), fade: (number) -> () }
+
+function Pose.rig(ctx: Kit.Ctx, caster: Model?): Rig?
+	if not caster then
+		return nil
+	end
+	local clone = CasterState.clone(ctx, caster)
+	for _, d in clone:GetDescendants() do
+		if d:IsA("Animator") or d:IsA("Script") or d:IsA("LocalScript") then
+			d:Destroy()
+		end
+	end
+	local hum = clone:FindFirstChildOfClass("Humanoid")
+	if hum then
+		hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+	end
+	local cr = clone:FindFirstChild("HumanoidRootPart")
+	local cloneRoot: BasePart? = if cr and cr:IsA("BasePart") then cr else nil
+	if cloneRoot then
+		cloneRoot.Anchored = true
+	end
+	clone.Name = "CasterPose"
+	clone.Parent = ctx.root
+
+	local motors: { [string]: any } = {}
+	for _, d in clone:GetDescendants() do
+		if d:IsA("Motor6D") then
+			motors[d.Name] = d
+		elseif d:IsA("AnimationConstraint") then
+			(d :: any).IsKinematic = true
+			motors[d.Name] = d
+		end
+	end
+	local base: { [BasePart]: number } = {}
+	for _, d in clone:GetDescendants() do
+		if d:IsA("BasePart") and d ~= cloneRoot then
+			base[d] = d.Transparency
+		end
+	end
+
+	table.insert(ctx.cleanups, function()
+		for _, m in motors do
+			m.Transform = CFrame.identity
+		end
+
+	end)
+
+	return {
+		clone = clone,
+		root = cloneRoot,
+		root0 = if cloneRoot then cloneRoot.CFrame else nil,
+		apply = function(pose: { [string]: CFrame })
+			for name, m in motors do
+				local cf = pose[name]
+				if cf then
+					m.Transform = cf
+				end
+			end
+		end,
+		move = function(cf: CFrame)
+			if cloneRoot then
+				cloneRoot.CFrame = cf
+			end
+		end,
+		fade = function(a: number)
+			for p, tr in base do
+				p.Transparency = tr + (1 - tr) * math.clamp(a, 0, 1)
+			end
+		end,
+	}
+end
+
+return Pose
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="13">
+        <Properties>
+          <string name="Name">SelfTest</string>
+          <string name="Source"><![CDATA[--!strict
+--[[ wakuVFX SelfTest (client, in Play). For every effect it checks:
+	  assets    every required texture id is set and ContentProvider fetches it (retries while a fresh upload is
+	            still processing, up to 45 s; a real failure stays FAIL)
+	  creation  the effect builds, draws its layers (parts, beams, emitters, decals) and records no blank ids
+	  rainbow   at mid-life the visible colours span at least 4 of 12 hue buckets
+	  playback  it plays without step errors and ends at its documented life (+-0.15 s of effect time)
+	  cleanup   1 s after the end: its Model is gone, workspace.wakuVFX is empty, the scheduler is disconnected,
+	            no scene grade is left in Lighting, and a posed caster is restored (back in place, joints reset)
+	usage: waku.SelfTest.run(waku, { places = { [name] = CFrame }, casters = { [name] = model }?, log = print? }) -> (pass, fail) ]]
+local ContentProvider = game:GetService("ContentProvider")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+local SelfTest = {}
+
+export type RunOpts = { places: { [string]: CFrame }?, casters: { [string]: Model? }?, log: ((string) -> ())?, only: { string }? }
+
+local function waitEffect(waku: any, t: number)
+	local deadline = os.clock() + math.max(t, 0) + 10
+	local t0 = waku.now()
+	while waku.now() - t0 < t do
+		assert(os.clock() < deadline, "SelfTest effect clock stalled; use timeScale=1")
+		RunService.Heartbeat:Wait()
+	end
+end
+
+local function hueBuckets(root: Instance): number
+	local seen: { [number]: boolean } = {}
+	local function add(c: Color3)
+		local h, s, v = c:ToHSV()
+		if s > 0.3 and v > 0.25 then
+			seen[math.floor(h * 12) % 12] = true
+		end
+	end
+	for _, d in root:GetDescendants() do
+		if d:IsA("Beam") and d.Enabled then
+			for _, k in d.Color.Keypoints do
+				add(k.Value)
+			end
+		elseif d:IsA("BasePart") and d.Transparency < 0.95 and d.CFrame.Y > -400 then
+			add(d.Color)
+		elseif d:IsA("Decal") and d.Transparency < 0.95 then
+			add(d.Color3)
+		end
+	end
+	local n = 0
+	for _ in seen do
+		n += 1
+	end
+	return n
+end
+
+function SelfTest.run(waku: any, o: RunOpts?): (number, number)
+	assert(waku.timeScale == nil or waku.timeScale == 1, "SelfTest requires timeScale=nil or 1")
+	local opts: RunOpts = o or {}
+	local log: (string) -> () = opts.log or (print :: any)
+	local pass, fail = 0, 0
+	local function check(ok: boolean, name: string, what: string, detail: string)
+		if ok then
+			pass += 1
+		else
+			fail += 1
+		end
+		log(string.format("[wakuVFX SelfTest] %s %s %s: %s", if ok then "PASS" else "FAIL", name, what, detail))
+	end
+
+	-- assets: fetch every id once (shared by the effects), retrying while Roblox still processes a fresh upload
+	local status: { [string]: string } = {}
+	local pending: { [string]: boolean } = {}
+	for key, id in waku.Assets do
+		if id ~= "" then
+			pending[key] = true
+		end
+	end
+	local deadline = os.clock() + 45
+	while next(pending) and os.clock() < deadline do
+		local list: { Instance } = {}
+		local byId: { [string]: string } = {}
+		for key in pending do
+			local d = Instance.new("Decal")
+			d.Texture = waku.Assets[key]
+			byId[waku.Assets[key]] = key
+			table.insert(list, d)
+		end
+		pcall(function()
+			ContentProvider:PreloadAsync(list, function(contentId: string, st: Enum.AssetFetchStatus)
+				local key = byId[contentId]
+				if key then
+					status[key] = st.Name
+					if st == Enum.AssetFetchStatus.Success then
+						pending[key] = nil
+					end
+				end
+			end)
+		end)
+		for _, d in list do
+			d:Destroy()
+		end
+		if next(pending) then
+			task.wait(3)
+		end
+	end
+
+	local order: { string } = opts.only or waku.Order
+	for _, name in order do
+		local spec = waku.Effects[name]
+		-- assets
+		local bad = {}
+		for _, key in spec.required do
+			local id = waku.Assets[key]
+			if id == nil or id == "" then
+				table.insert(bad, key .. "=blank")
+			elseif status[key] ~= "Success" then
+				table.insert(bad, key .. "=" .. tostring(status[key]))
+			end
+		end
+		check(#bad == 0, name, "assets", if #bad == 0 then string.format("%d/%d textures fetched", #spec.required, #spec.required) else table.concat(bad, ", "))
+
+		-- creation
+		local missingBefore: { [string]: number } = table.clone(waku.Missing)
+		local errBefore = #waku.Errors
+		local cf = (opts.places and opts.places[name]) or CFrame.new(0, 3, 0)
+		local caster = if opts.casters then opts.casters[name] else nil
+		local casterParent = caster and caster.Parent
+		local transparency: { [Instance]: number } = {}
+		local anchored: { [BasePart]: boolean } = {}
+		if caster then
+			for _, d in caster:GetDescendants() do
+				if d:IsA("BasePart") or d:IsA("Decal") then
+					transparency[d] = (d :: any).Transparency
+				end
+				if d:IsA("BasePart") then anchored[d] = d.Anchored end
+			end
+		end
+		local tStart = waku.now()
+		local h = waku.play(name, cf, { caster = caster })
+		RunService.Heartbeat:Wait()
+		local nParts, nBeams, nEmit, nDecal = 0, 0, 0, 0
+		if h then
+			for _, d in h.root:GetDescendants() do
+				if d:IsA("BasePart") then
+					nParts += 1
+				elseif d:IsA("Beam") then
+					nBeams += 1
+				elseif d:IsA("ParticleEmitter") then
+					nEmit += 1
+				elseif d:IsA("Decal") then
+					nDecal += 1
+				end
+			end
+		end
+		local newMissing = {}
+		for k, v in waku.Missing do
+			if v > (missingBefore[k] or 0) then
+				table.insert(newMissing, k)
+			end
+		end
+		check(h ~= nil and nParts > 0 and nEmit > 0 and #newMissing == 0, name, "creation",
+			string.format("parts=%d beams=%d emitters=%d decals=%d blankIds=[%s]", nParts, nBeams, nEmit, nDecal, table.concat(newMissing, ",")))
+		if not h then
+			continue
+		end
+
+		-- rainbow, sampled at mid-life (EarthRise: when the pillars stand)
+		local mid = if name == "EarthRise" then 1.6 else spec.life * 0.3
+		waitEffect(waku, mid - (waku.now() - tStart))
+		local nb = hueBuckets(h.root)
+		check(nb >= 4, name, "rainbow", string.format("%d/12 hue buckets visible at t=%.2f s", nb, waku.now() - tStart))
+
+		-- playback
+		local playbackDeadline = os.clock() + spec.life + 10
+		while h.alive() and os.clock() < playbackDeadline do
+			RunService.Heartbeat:Wait()
+		end
+		local timedOut = h.alive()
+		if timedOut then h.stop() end
+		local ended = waku.now() - tStart
+		local errs = #waku.Errors - errBefore
+		check(not timedOut and math.abs(ended - spec.life) <= 0.15 and errs == 0, name, "playback",
+			string.format("life %.2f s, ended at %.3f s, step errors %d", spec.life, ended, errs))
+
+		-- cleanup
+		task.wait(1)
+		local grades = 0
+		for _, x in game:GetService("Lighting"):GetChildren() do
+			if string.sub(x.Name, 1, 13) == "wakuVFX_Grade" then
+				grades += 1
+			end
+		end
+		local folder = Workspace:FindFirstChild("wakuVFX")
+		local left = if folder then #folder:GetChildren() else 0
+		local casterOk = true
+		local posed = 0
+		local jointsNote = ""
+		if caster then
+			casterOk = caster.Parent == casterParent
+			-- a player character's own Animator (idle tracks) writes Transform every frame, so identity joints can
+			-- only be required of casters with no playing tracks; the effect only ever poses its own clone
+			local an = caster:FindFirstChildWhichIsA("Animator", true)
+			local tracks = if an then #an:GetPlayingAnimationTracks() else 0
+			if tracks > 0 then
+				jointsNote = string.format(" (n/a: caster animated by its own Animator, %d tracks)", tracks)
+			else
+				for _, d in caster:GetDescendants() do
+					if (d:IsA("Motor6D") or d:IsA("AnimationConstraint")) and (d :: any).Transform ~= CFrame.identity then
+						posed += 1
+					end
+				end
+			end
+			for d, tr in transparency do
+				if d.Parent == nil or (d :: any).Transparency ~= tr then casterOk = false end
+			end
+			for d, value in anchored do
+				if d.Parent == nil or d.Anchored ~= value then casterOk = false end
+			end
+		end
+		check(h.root.Parent == nil and left == 0 and waku.activeCount() == 0 and not waku.connected() and casterOk and posed == 0 and grades == 0,
+			name, "cleanup", string.format("model gone=%s, wakuVFX children=%d, active=%d, connected=%s, caster restored=%s, joints posed=%d%s, scene grades left=%d",
+				tostring(h.root.Parent == nil), left, waku.activeCount(), tostring(waku.connected()), tostring(casterOk), posed, jointsNote, grades))
+	end
+	log(string.format("[wakuVFX SelfTest] DONE pass=%d fail=%d", pass, fail))
+	return pass, fail
+end
+
+return SelfTest
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="StarterPlayer" referent="14">
+    <Properties>
+      <string name="Name">StarterPlayer</string>
+    </Properties>
+    <Item class="StarterPlayerScripts" referent="15">
+      <Properties>
+        <string name="Name">StarterPlayerScripts</string>
+      </Properties>
+      <Item class="LocalScript" referent="16">
+        <Properties>
+          <string name="Name">wakuDemo</string>
+          <string name="Source"><![CDATA[--!strict
+-- wakuVFX demo: press 1 PrismCleave, 2 CrystalBloom, 3 StormLance, 4 EarthRise on your own character (gamepad: X/Y/B/A).
+-- Client-only visuals. For multiplayer, send one RemoteEvent and call waku.play on every client.
+local ContextActionService = game:GetService("ContextActionService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+local waku = require(ReplicatedStorage:WaitForChild("wakuVFX"))
+local player = Players.LocalPlayer
+task.spawn(waku.preload)
+
+local BIND = {
+	{ fx = "PrismCleave", keys = { Enum.KeyCode.One, Enum.KeyCode.ButtonX }, title = "Slash" },
+	{ fx = "CrystalBloom", keys = { Enum.KeyCode.Two, Enum.KeyCode.ButtonY }, title = "Ice" },
+	{ fx = "StormLance", keys = { Enum.KeyCode.Three, Enum.KeyCode.ButtonB }, title = "Bolt" },
+	{ fx = "EarthRise", keys = { Enum.KeyCode.Four, Enum.KeyCode.ButtonA }, title = "Earth" },
+}
+local busy: { [string]: boolean } = {}
+
+local function groundUnder(char: Model, pos: Vector3): Vector3
+	local params = RaycastParams.new()
+	params.FilterDescendantsInstances = { char }
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local hit = Workspace:Raycast(pos, Vector3.new(0, -20, 0), params)
+	return if hit then hit.Position else pos - Vector3.new(0, 3, 0)
+end
+
+local function cast(fx: string)
+	local char = player.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not (char and hrp and hrp:IsA("BasePart")) then
+		return
+	end
+	local look = hrp.CFrame.LookVector * Vector3.new(1, 0, 1)
+	look = if look.Magnitude > 1e-3 then look.Unit else Vector3.new(0, 0, -1)
+	-- moves that pose the caster share one lock (one posed clone at a time)
+	local key = if fx == "CrystalBloom" then fx else "pose"
+	if busy[key] then
+		return
+	end
+	local h
+	if fx == "PrismCleave" then
+		h = waku.play(fx, CFrame.lookAt(hrp.Position, hrp.Position + look), { caster = char })
+	elseif fx == "EarthRise" then
+		local g = groundUnder(char, hrp.Position)
+		h = waku.play(fx, CFrame.lookAt(g, g + look), { caster = char })
+	elseif fx == "StormLance" then
+		local g = groundUnder(char, hrp.Position + look * 10)
+		h = waku.play(fx, CFrame.new(g), { caster = char })
+	else
+		local g = groundUnder(char, hrp.Position + look * 12)
+		h = waku.play(fx, CFrame.new(g))
+	end
+	if h and fx ~= "CrystalBloom" then
+		busy[key] = true
+		task.delay(h.life + 0.1, function()
+			busy[key] = nil
+		end)
+	end
+	-- camera shake through the humanoid's CameraOffset
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if h and hum then
+		local conn: RBXScriptConnection
+		conn = RunService.RenderStepped:Connect(function()
+			if h.alive() then
+				hum.CameraOffset = waku.shake(fx, waku.now() - h.t0)
+			else
+				hum.CameraOffset = Vector3.zero
+				conn:Disconnect()
+			end
+		end)
+	end
+end
+
+for _, b in BIND do
+	local name = "waku_" .. b.fx
+	ContextActionService:BindAction(name, function(_: string, state: Enum.UserInputState): Enum.ContextActionResult
+		if state == Enum.UserInputState.Begin then
+			cast(b.fx)
+			return Enum.ContextActionResult.Sink
+		end
+		return Enum.ContextActionResult.Pass
+	end, true, table.unpack(b.keys))
+	ContextActionService:SetTitle(name, b.title)
+end
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="Workspace" referent="17">
+    <Properties>
+      <string name="Name">Workspace</string>
+      <bool name="NeedsPivotMigration">false</bool>
+    </Properties>
+    <Item class="Part" referent="18">
+      <Properties>
+        <string name="Name">Baseplate</string>
+        <bool name="Anchored">true</bool>
+        <Color3uint8 name="Color3uint8">4014157</Color3uint8>
+        <token name="Material">272</token>
+        <Vector3 name="Position">
+          <X>0</X>
+          <Y>-1</Y>
+          <Z>0</Z>
+        </Vector3>
+        <Vector3 name="size">
+          <X>512</X>
+          <Y>2</Y>
+          <Z>512</Z>
+        </Vector3>
+        <token name="TopSurface">0</token>
+      </Properties>
+    </Item>
+    <Item class="SpawnLocation" referent="19">
+      <Properties>
+        <string name="Name">SpawnLocation</string>
+        <bool name="Anchored">true</bool>
+        <bool name="Neutral">true</bool>
+        <Vector3 name="Position">
+          <X>0</X>
+          <Y>0.5</Y>
+          <Z>0</Z>
+        </Vector3>
+        <Vector3 name="size">
+          <X>8</X>
+          <Y>1</Y>
+          <Z>8</Z>
+        </Vector3>
+      </Properties>
+    </Item>
+  </Item>
+</roblox>

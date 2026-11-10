@@ -1,0 +1,74 @@
+{
+  "name": "wakuVFX_demo",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "wakuVFX": {
+        "$path": "src/wakuVFX"
+      }
+    },
+    "StarterPlayer": {
+      "StarterPlayerScripts": {
+        "wakuDemo": {
+          "$path": "src/demo/wakuDemo.client.luau"
+        }
+      }
+    },
+    "Workspace": {
+      "Baseplate": {
+        "$className": "Part",
+        "$properties": {
+          "Anchored": true,
+          "Size": [
+            512,
+            2,
+            512
+          ],
+          "Position": [
+            0,
+            -1,
+            0
+          ],
+          "Color": [
+            0.24,
+            0.25,
+            0.3
+          ],
+          "Material": "SmoothPlastic",
+          "TopSurface": "Smooth"
+        }
+      },
+      "SpawnLocation": {
+        "$className": "SpawnLocation",
+        "$properties": {
+          "Anchored": true,
+          "Size": [
+            8,
+            1,
+            8
+          ],
+          "Position": [
+            0,
+            0.5,
+            0
+          ],
+          "Neutral": true
+        }
+      }
+    },
+    "Lighting": {
+      "$properties": {
+        "ClockTime": 9,
+        "Brightness": 1.3
+      },
+      "Bloom": {
+        "$className": "BloomEffect",
+        "$properties": {
+          "Intensity": 0.7,
+          "Size": 24,
+          "Threshold": 1.4
+        }
+      }
+    }
+  }
+}

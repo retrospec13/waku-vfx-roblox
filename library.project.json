@@ -1,0 +1,11 @@
+{
+  "name": "wakuVFX_library",
+  "tree": {
+    "$className": "DataModel",
+    "$ignoreUnknownInstances": true,
+    "ReplicatedStorage": {
+      "$ignoreUnknownInstances": true,
+      "wakuVFX": { "$path": "src/wakuVFX" }
+    }
+  }
+}

@@ -1,0 +1,98 @@
+[
+ {
+  "key": "bolt_glow",
+  "file": "textures/bolt_glow.png",
+  "id": "rbxassetid://72655402834181",
+  "sha256": "60fae05403df36ea4f032ca50b195b890e98ec80000817cc91b0586e0f0b8987"
+ },
+ {
+  "key": "frost_crack",
+  "file": "textures/frost_crack.png",
+  "id": "rbxassetid://75329703022442",
+  "sha256": "ba022fb664929a4f413db17ad211f8172f2675dceafcb97ecb98e7c98e814812"
+ },
+ {
+  "key": "frost_ground",
+  "file": "textures/frost_ground.png",
+  "id": "rbxassetid://122141137658420",
+  "sha256": "343bc3e043398f6ff82e90949ee4d21cea9c7441f098793ac1651ba0aefb7b32"
+ },
+ {
+  "key": "frost_ring",
+  "file": "textures/frost_ring.png",
+  "id": "rbxassetid://130078436122278",
+  "sha256": "74479a55bdc3bcff8ff6a16195c9aeeace0c3f5c42056af5b78830651a53327f"
+ },
+ {
+  "key": "glow_soft",
+  "file": "textures/glow_soft.png",
+  "id": "rbxassetid://108086570872537",
+  "sha256": "ee19f6c127e009a67cc5bfcb722831eb3a58e1df6d3ce43214b18738594b1f98"
+ },
+ {
+  "key": "ground_crack",
+  "file": "textures/ground_crack.png",
+  "id": "rbxassetid://131000614993035",
+  "sha256": "4b84f92f0ecd3b59331e24af9691b73a401abe703875e6cfd3ac5dafef3efc2a"
+ },
+ {
+  "key": "ground_disc",
+  "file": "textures/ground_disc.png",
+  "id": "rbxassetid://98035594275693",
+  "sha256": "e829d384607e6171cad80eea2e2fcd70a665b51e83c1210bb8f08331307bf02a"
+ },
+ {
+  "key": "ice_shard",
+  "file": "textures/ice_shard.png",
+  "id": "rbxassetid://90733422362747",
+  "sha256": "2352a5a601b38fc9078d0ed58254f7141c5694931809029aa837841ef5a258a4"
+ },
+ {
+  "key": "shock_ring",
+  "file": "textures/shock_ring.png",
+  "id": "rbxassetid://127393806720166",
+  "sha256": "5413483d0c9dcf100bb0bc6dad195895066db1638dfaa3f06a65881ef0195420"
+ },
+ {
+  "key": "slash_body",
+  "file": "textures/slash_body.png",
+  "id": "rbxassetid://71623767325279",
+  "sha256": "838218a14a9dce7dbf725841a32637822865df87c8b4d4fbda151db49d646a7f"
+ },
+ {
+  "key": "slash_edge",
+  "file": "textures/slash_edge.png",
+  "id": "rbxassetid://76962741210489",
+  "sha256": "c9f1d76516ccd9466b1e372ab1c755eb57d53458ffe9d7334817c9c08d45996f"
+ },
+ {
+  "key": "slash_ink",
+  "file": "textures/slash_ink.png",
+  "id": "rbxassetid://92479750408080",
+  "sha256": "7755c01fa97f48095a63fdd2b1f55e9dfd7355326043e08b4a487d82a36a669a"
+ },
+ {
+  "key": "slash_rim",
+  "file": "textures/slash_rim.png",
+  "id": "rbxassetid://120929258981364",
+  "sha256": "a42d134fbef5cf991d00ce779098976124fb5d04b0fce56fe65ba0f639451a3c"
+ },
+ {
+  "key": "smoke_puff",
+  "file": "textures/smoke_puff.png",
+  "id": "rbxassetid://105244598738114",
+  "sha256": "9076458b69916a473984b941d37f70668a3b30a4ed32f1e4fa716895af4ac903"
+ },
+ {
+  "key": "spark_glint",
+  "file": "textures/spark_glint.png",
+  "id": "rbxassetid://120096211228402",
+  "sha256": "ee8f592589463b6511cc748e9692e6d0c5c2fbd42ce1e842e1b5f1905df281b5"
+ },
+ {
+  "key": "spark_streak",
+  "file": "textures/spark_streak.png",
+  "id": "rbxassetid://134459142509963",
+  "sha256": "b33420d2903ceda06c229af0d15d046b3d587e69ddb3be0cc6cf2d0a74ab4ad4"
+ }
+]

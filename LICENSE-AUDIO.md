@@ -1,4 +1,4 @@
-# Set 2 audio reuse
+# Set 2 and Set 3 audio reuse
 
 The ElevenLabs sound effects in `audio/` were made and supplied by Waku Worldwide for this kit.
 

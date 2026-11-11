@@ -6,7 +6,7 @@ local Kit = {}
 
 Kit.missing = {} :: { [string]: number }
 
-export type Opts = { rainbow: boolean, hue: number, scale: number, caster: Model?, seed: number, grade: boolean? }
+export type Opts = { rainbow: boolean, hue: number, scale: number, caster: Model?, seed: number, grade: boolean?, to: Vector3? }
 export type Ctx = {
 	root: Model,
 	cf: CFrame,
@@ -17,6 +17,8 @@ export type Ctx = {
 	cleanups: { () -> () },
 	rig: Part,
 	host: Part,
+	outro: number?, -- set by build: seconds of closing animation handle.stop() should still play (RiftGate, WardShell)
+	stopAt: number?, -- set by handle.stop(): effect time the stop was asked for; the effect closes from here
 }
 
 Kit.HIDE = CFrame.new(0, -5000, 0)
@@ -105,6 +107,11 @@ function Kit.hueSeq(h0: number, span: number, s: number?, v: number?, n: number?
 		table.insert(kps, ColorSequenceKeypoint.new(f, Color3.fromHSV((h0 + span * f) % 1, s or 0.9, v or 1)))
 	end
 	return ColorSequence.new(kps)
+end
+
+-- Kit.hueSeq that honours opts.rainbow: the full span in rainbow mode, a narrow run round the hue otherwise
+function Kit.seq(ctx: Ctx, h0: number, span: number, s: number?, v: number?, n: number?): ColorSequence
+	return Kit.hueSeq(h0, if ctx.opts.rainbow then span else span * 0.12, s, v, n)
 end
 
 -- instances --------------------------------------------------------------------------------------------------
@@ -525,6 +532,73 @@ function Kit.rightTo(p: Vector3, d: Vector3): CFrame
 		r = u:Cross(Vector3.xAxis)
 	end
 	return CFrame.fromMatrix(p, u, r.Unit)
+end
+
+-- jagged lightning between two points: n straight segments whose joints are thrown off the line. set(p0, p1, width,
+-- jag (fraction of the length), seed, colour, transparency); the same seed always draws the same bolt, so a dark
+-- core and its glow can share one path and a frozen frame repeats exactly.
+export type Bolt = { beams: { Beam }, set: (Vector3, Vector3, number, number, number, Color3, number) -> (), hide: () -> () }
+function Kit.bolt(ctx: Ctx, name: string, n: number, z: number?, le: number?): Bolt
+	local atts: { Attachment } = {}
+	local beams: { Beam } = {}
+	for i = 1, n + 1 do
+		atts[i] = Kit.att(ctx)
+	end
+	for i = 1, n do
+		local b = Kit.beam(ctx, atts[i], atts[i + 1], "bolt_glow", z or 0)
+		b.Name = name
+		b.Segments = 1
+		b.LightEmission = le or 1
+		b.Enabled = false
+		beams[i] = b
+	end
+	local function hide()
+		for _, b in beams do
+			b.Enabled = false
+		end
+	end
+	return {
+		beams = beams,
+		set = function(p0: Vector3, p1: Vector3, width: number, jag: number, seed: number, color: Color3, transp: number)
+			local d = p1 - p0
+			local len = d.Magnitude
+			if transp >= 0.995 or width <= 0 or len < 1e-4 then
+				hide()
+				return
+			end
+			local r = Random.new(math.floor(seed))
+			local u = d:Cross(Vector3.yAxis)
+			if u.Magnitude < 1e-3 then
+				u = d:Cross(Vector3.xAxis)
+			end
+			u = u.Unit
+			local v = u:Cross(d.Unit)
+			for i = 1, n + 1 do
+				local k = if i == 1 or i == n + 1 then 0 else jag * len
+				atts[i].CFrame = CFrame.new(p0 + d * ((i - 1) / n) + (u * r:NextNumber(-1, 1) + v * r:NextNumber(-1, 1)) * k)
+			end
+			local cs = ColorSequence.new(color)
+			local ts = NumberSequence.new(math.clamp(transp, 0, 1))
+			for i, b in beams do
+				b.Width0 = width * (1 - 0.7 * (i - 1) / n)
+				b.Width1 = width * (1 - 0.7 * i / n)
+				b.Color = cs
+				b.Transparency = ts
+				b.Enabled = true
+			end
+		end,
+		hide = hide,
+	}
+end
+
+-- one expanding ring on a Kit.plate: u = 0..1 through its life, size s0 -> s1 (studs), opacity fading from a0
+function Kit.pulse(pl: Plate, pos: Vector3, normal: Vector3, u: number, s0: number, s1: number, a0: number?, rot: number?)
+	if u <= 0 or u >= 1 then
+		pl.hide()
+		return
+	end
+	local a = a0 or 0
+	pl.set(pos, normal, s0 + (s1 - s0) * Kit.easeOut(u), a + (1 - a) * u * u, rot)
 end
 
 return Kit

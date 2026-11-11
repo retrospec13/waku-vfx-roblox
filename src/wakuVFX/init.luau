@@ -12,6 +12,11 @@
 	  waku.play("ChargeBeam", hrp.CFrame, { caster = character })       -- gather, then a thick beam along LookVector
 	  waku.play("GhostDash", hrp.CFrame, { caster = character })        -- afterimages + trail; the game moves the caster
 	  waku.play("ImpactFlash", CFrame.lookAt(contact, contact + blowDir), { caster = character }) -- B/W impact frame
+	  waku.play("QuakeSlam", CFrame.new(groundPos))                     -- giant ground slam, cracks, flying rock
+	  waku.play("BlinkStep", hrp.CFrame, { caster = character, to = arrivePos }) -- vanish, thunderclap arrival; the game moves the caster
+	  local gate = waku.play("RiftGate", CFrame.lookAt(centre, centre + facing)) -- portal; gate.stop() folds it shut (4.7 s if left)
+	  local ward = waku.play("WardShell", hrp.CFrame, { caster = character }) -- guard bubble; ward.stop() shatters it (3.4 s if left)
+	  waku.play("Fireball", hrp.CFrame)                                 -- house-sized fireball along LookVector; { rainbow = false, hue = 0.03 } = orange
 
 	Options vary by effect; see README. Same-caster posed overlap returns nil and records a build error.
 	Everything runs on ONE Heartbeat connection and one effect clock (waku.now). waku.timeScale: nil = real time,
@@ -56,11 +61,17 @@ waku.Effects = {
 	ChargeBeam = require(script.Effects.ChargeBeam) :: Spec,
 	GhostDash = require(script.Effects.GhostDash) :: Spec,
 	ImpactFlash = require(script.Effects.ImpactFlash) :: Spec,
+	QuakeSlam = require(script.Effects.QuakeSlam) :: Spec,
+	BlinkStep = require(script.Effects.BlinkStep) :: Spec,
+	RiftGate = require(script.Effects.RiftGate) :: Spec,
+	WardShell = require(script.Effects.WardShell) :: Spec,
+	Fireball = require(script.Effects.Fireball) :: Spec,
 }
-waku.Order = { "PrismCleave", "CrystalBloom", "StormLance", "EarthRise", "ChargeAura", "HitBurst", "ChargeBeam", "GhostDash", "ImpactFlash" }
+waku.Order = { "PrismCleave", "CrystalBloom", "StormLance", "EarthRise", "ChargeAura", "HitBurst", "ChargeBeam", "GhostDash", "ImpactFlash",
+	"QuakeSlam", "BlinkStep", "RiftGate", "WardShell", "Fireball" }
 waku.SelfTest = require(script.SelfTest)
 
-export type Options = { rainbow: boolean?, hue: number?, scale: number?, caster: Model?, seed: number?, grade: boolean? }
+export type Options = { rainbow: boolean?, hue: number?, scale: number?, caster: Model?, seed: number?, grade: boolean?, to: Vector3? }
 export type Handle = { name: string, root: Model, t0: number, life: number, stop: () -> (), alive: () -> boolean }
 
 type Running = { handle: Handle, ctx: Kit.Ctx, update: (number) -> (), ended: boolean }
@@ -144,6 +155,7 @@ function waku.play(name: string, cf: CFrame, opts: Options?): Handle?
 		caster = o.caster,
 		seed = o.seed or 7,
 		grade = o.grade,
+		to = o.to,
 	})
 	local r: Running
 	local handle: Handle = {
@@ -152,7 +164,16 @@ function waku.play(name: string, cf: CFrame, opts: Options?): Handle?
 		t0 = t0,
 		life = spec.life,
 		stop = function()
-			if r then
+			if not r or r.ended then
+				return
+			end
+			-- effects with a closing animation (ctx.outro) play it once; a second stop() ends them at once
+			local outro = ctx.outro
+			local t = waku.now() - t0
+			if outro and ctx.stopAt == nil and t + outro < r.handle.life then
+				ctx.stopAt = t
+				r.handle.life = t + outro
+			else
 				finish(r)
 			end
 		end,

@@ -1,5 +1,5 @@
 --!strict
--- One pose owner per original caster, shared by Pose and EarthRise.
+-- One pose owner per original caster, shared by Pose, EarthRise and BlinkStep.
 -- A second posed effect fails cleanly instead of snapshotting an already hidden rig.
 local Players = game:GetService("Players")
 local CasterState = {}
@@ -61,6 +61,49 @@ function CasterState.clone(ctx: any, caster: Model): Model
 		caster.Parent = nil
 	end
 	return clone
+end
+
+-- Hide a caster in place for part of an effect (BlinkStep): no clone, no anchoring, no reparenting, so the game can
+-- keep moving the character. Takes the same one-owner lock as clone(); returns hide() and restore(). restore() also
+-- runs from the effect's cleanup, so a stopped or failed effect never leaves the caster invisible.
+function CasterState.hider(ctx: any, caster: Model): (() -> (), () -> ())
+	if owners[caster] then
+		error("caster already has an active pose; stop the previous handle first")
+	end
+	local token = {}
+	owners[caster] = token
+	local hidden: { [Instance]: number } = {}
+	local released = false
+	local function show()
+		for d, tr in hidden do
+			if d.Parent then
+				(d :: any).Transparency = tr
+			end
+		end
+		table.clear(hidden)
+	end
+	local function restore()
+		show()
+		if not released then
+			released = true
+			if owners[caster] == token then
+				owners[caster] = nil
+			end
+		end
+	end
+	table.insert(ctx.cleanups, restore)
+	local function hide()
+		if released or next(hidden) ~= nil then
+			return
+		end
+		for _, d in caster:GetDescendants() do
+			if d:IsA("BasePart") or d:IsA("Decal") then
+				hidden[d] = (d :: any).Transparency;
+				(d :: any).Transparency = 1
+			end
+		end
+	end
+	return hide, restore
 end
 
 return CasterState

@@ -1,0 +1,554 @@
+{
+ "name": "set3",
+ "project": "dev.project.json",
+ "place": "wakuvfx_dev.rbxlx",
+ "mood": "dusk",
+ "effects": [
+  "QuakeSlam",
+  "BlinkStep",
+  "RiftGate",
+  "WardShell",
+  "Fireball"
+ ],
+ "lives": {
+  "QuakeSlam": 1.9,
+  "BlinkStep": 0.85,
+  "RiftGate": 4.7,
+  "WardShell": 3.4,
+  "Fireball": 1.6
+ },
+ "looks": [
+  {
+   "fx": "QuakeSlam",
+   "cam": "QuakeSlam",
+   "dt": 0.0667
+  },
+  {
+   "fx": "BlinkStep",
+   "cam": "BlinkStep",
+   "dt": 0.0333
+  },
+  {
+   "fx": "RiftGate",
+   "cam": "RiftGate",
+   "dt": 0.1,
+   "tend": 2.3,
+   "stop": 1.6
+  },
+  {
+   "fx": "WardShell",
+   "cam": "WardShell",
+   "dt": 0.1
+  },
+  {
+   "fx": "Fireball",
+   "cam": "Fireball",
+   "dt": 0.0667
+  },
+  {
+   "fx": "QuakeSlam",
+   "cam": "QuakeSlam_low",
+   "dt": 0.0667,
+   "tend": 1.5
+  },
+  {
+   "fx": "BlinkStep",
+   "cam": "BlinkStep_arrive",
+   "dt": 0.0333
+  },
+  {
+   "fx": "RiftGate",
+   "cam": "RiftGate_close",
+   "dt": 0.1,
+   "tend": 1.2
+  },
+  {
+   "fx": "WardShell",
+   "cam": "WardShell_close",
+   "dt": 0.1,
+   "tstart": 0.9
+  },
+  {
+   "fx": "Fireball",
+   "cam": "Fireball_caster",
+   "dt": 0.05,
+   "tend": 1.0
+  },
+  {
+   "fx": "Fireball",
+   "cam": "Fireball_wall",
+   "dt": 0.05,
+   "tstart": 0.5
+  },
+  {
+   "fx": "Fireball",
+   "cam": "Fireball",
+   "dt": 0.0667,
+   "opts": "rainbow=0,hue=0.03"
+  }
+ ],
+ "shots": [
+  {
+   "tag": "tQS",
+   "fx": "QuakeSlam",
+   "cam": "QuakeSlam_low",
+   "tEnd": 1.2,
+   "pre": 0.0667
+  },
+  {
+   "tag": "tQSs",
+   "fx": "QuakeSlam",
+   "cam": "QuakeSlam",
+   "tStart": 0.15,
+   "tEnd": 0.78,
+   "speed": 0.5
+  },
+  {
+   "tag": "tBS",
+   "fx": "BlinkStep",
+   "cam": "BlinkStep",
+   "tEnd": 0.85,
+   "pre": 0.0667
+  },
+  {
+   "tag": "tBSs",
+   "fx": "BlinkStep",
+   "cam": "BlinkStep_arrive",
+   "tStart": 0.28,
+   "tEnd": 0.7,
+   "speed": 0.3333
+  },
+  {
+   "tag": "tRG",
+   "fx": "RiftGate",
+   "cam": "RiftGate",
+   "tEnd": 2.1,
+   "stop": 1.6,
+   "pre": 0.0667
+  },
+  {
+   "tag": "tRGc",
+   "fx": "RiftGate",
+   "cam": "RiftGate_close",
+   "tEnd": 0.62,
+   "speed": 0.5
+  },
+  {
+   "tag": "tWS",
+   "fx": "WardShell",
+   "cam": "WardShell",
+   "tEnd": 2.6,
+   "stop": 2.2,
+   "pre": 0.0667
+  },
+  {
+   "tag": "tWSs",
+   "fx": "WardShell",
+   "cam": "WardShell_hit",
+   "tStart": 0.95,
+   "tEnd": 1.25,
+   "speed": 0.25
+  },
+  {
+   "tag": "tWSb",
+   "fx": "WardShell",
+   "cam": "WardShell_close",
+   "tStart": 2.15,
+   "tEnd": 2.62,
+   "stop": 2.2,
+   "speed": 0.5
+  },
+  {
+   "tag": "tFB",
+   "fx": "Fireball",
+   "cam": "Fireball_caster",
+   "tEnd": 1.2,
+   "pre": 0.0667
+  },
+  {
+   "tag": "tFBs",
+   "fx": "Fireball",
+   "cam": "Fireball_wall",
+   "tStart": 0.55,
+   "tEnd": 1.3,
+   "speed": 0.5
+  },
+  {
+   "tag": "tEND",
+   "fx": "RiftGate",
+   "cam": "RiftGate_close",
+   "tStart": 0.5,
+   "tEnd": 4.5
+  }
+ ],
+ "trailer": {
+  "out": "trailer/wakuVFX_set3_silent.mp4",
+  "total": 900,
+  "timeline": [
+   {
+    "video": "trailer/hf/hf_opener3.mp4",
+    "kind": "open",
+    "take": [
+     66,
+     150
+    ],
+    "flash": false
+   },
+   {
+    "shot": "tQS",
+    "kind": "qs"
+   },
+   {
+    "shot": "tQSs",
+    "kind": "qss",
+    "flash": false
+   },
+   {
+    "shot": "tBS",
+    "kind": "bs"
+   },
+   {
+    "shot": "tBSs",
+    "kind": "bss",
+    "flash": false
+   },
+   {
+    "shot": "tRG",
+    "kind": "rg"
+   },
+   {
+    "shot": "tRGc",
+    "kind": "rgc",
+    "flash": false
+   },
+   {
+    "shot": "tWS",
+    "kind": "ws"
+   },
+   {
+    "shot": "tWSs",
+    "kind": "wss",
+    "flash": false
+   },
+   {
+    "shot": "tWSb",
+    "kind": "wsb",
+    "flash": false
+   },
+   {
+    "shot": "tFB",
+    "kind": "fb"
+   },
+   {
+    "shot": "tFBs",
+    "kind": "fbs",
+    "flash": false
+   },
+   {
+    "video": "trailer/hf/hf_gate.mp4",
+    "kind": "aig",
+    "take": [
+     20,
+     110
+    ]
+   },
+   {
+    "video": "trailer/hf/hf_ward.mp4",
+    "kind": "aiw",
+    "take": [
+     0,
+     84
+    ],
+    "flash": false
+   },
+   {
+    "shot": "tQS",
+    "kind": "recap",
+    "take": [
+     8,
+     18
+    ]
+   },
+   {
+    "shot": "tBS",
+    "kind": "recap",
+    "take": [
+     12,
+     22
+    ]
+   },
+   {
+    "shot": "tWSb",
+    "kind": "recap",
+    "take": [
+     3,
+     13
+    ]
+   },
+   {
+    "shot": "tFBs",
+    "kind": "recap",
+    "take": [
+     14,
+     24
+    ]
+   },
+   {
+    "end": [
+     {
+      "shot": "tEND"
+     }
+    ]
+   }
+  ]
+ },
+ "audio": {
+  "dir": "audio/mix",
+  "more_dirs": [],
+  "out": "trailer/wakuVFX_set3_trailer_30s.mp4",
+  "cues": [
+   {
+    "clip": "riser",
+    "at": "open",
+    "offset": 0,
+    "db": -19,
+    "fout": 0.3,
+    "until": "qs",
+    "until_offset": 0.3
+   },
+   {
+    "clip": "s3_quake",
+    "at": "qs",
+    "offset": 0.15,
+    "db": -13
+   },
+   {
+    "clip": "el_slowmo_2",
+    "at": "qss",
+    "offset": 0,
+    "db": -22,
+    "dur": 1.25,
+    "fout": 0.3
+   },
+   {
+    "clip": "s3_quake_b",
+    "at": "qss",
+    "offset": 0.05,
+    "db": -18
+   },
+   {
+    "clip": "s3_blink",
+    "at": "bs",
+    "offset": 0.07,
+    "db": -15,
+    "dur": 1.2,
+    "fout": 0.3
+   },
+   {
+    "clip": "s3_quake_b",
+    "at": "bs",
+    "offset": 0.36,
+    "db": -19,
+    "dur": 0.6,
+    "fout": 0.2
+   },
+   {
+    "clip": "el_slowmo_4",
+    "at": "bss",
+    "offset": 0,
+    "db": -22,
+    "dur": 1.3,
+    "fout": 0.3
+   },
+   {
+    "clip": "el_slam_1",
+    "at": "bss",
+    "offset": 0.05,
+    "db": -17,
+    "dur": 1.0,
+    "fout": 0.3
+   },
+   {
+    "clip": "s3_gate",
+    "at": "rg",
+    "offset": -0.2,
+    "db": -15
+   },
+   {
+    "clip": "s3_gate_b",
+    "at": "rg",
+    "offset": 1.72,
+    "db": -16
+   },
+   {
+    "clip": "s3_gate",
+    "at": "rgc",
+    "offset": 0.1,
+    "db": -19,
+    "dur": 1.2,
+    "fout": 0.3
+   },
+   {
+    "clip": "el_slowmo_2",
+    "at": "rgc",
+    "offset": 0,
+    "db": -23,
+    "dur": 1.25,
+    "fout": 0.3
+   },
+   {
+    "clip": "s3_ward",
+    "at": "ws",
+    "offset": 0.05,
+    "db": -15
+   },
+   {
+    "clip": "s3_wardhit",
+    "at": "ws",
+    "offset": 1.0,
+    "db": -15
+   },
+   {
+    "clip": "s3_wardhit",
+    "at": "ws",
+    "offset": 1.85,
+    "db": -14
+   },
+   {
+    "clip": "s3_shatter",
+    "at": "ws",
+    "offset": 2.2,
+    "db": -14,
+    "dur": 0.9,
+    "fout": 0.35
+   },
+   {
+    "clip": "el_slowmo_4",
+    "at": "wss",
+    "offset": 0.4,
+    "db": -22,
+    "dur": 0.8,
+    "fout": 0.3
+   },
+   {
+    "clip": "s3_wardhit",
+    "at": "wss",
+    "offset": 0.2,
+    "db": -17
+   },
+   {
+    "clip": "s3_shatter",
+    "at": "wsb",
+    "offset": 0.1,
+    "db": -16,
+    "dur": 1.1,
+    "fout": 0.3
+   },
+   {
+    "clip": "s3_fire",
+    "at": "fb",
+    "offset": 0.05,
+    "db": -14,
+    "dur": 1.3,
+    "fout": 0.25
+   },
+   {
+    "clip": "s3_fire_b",
+    "at": "fb",
+    "offset": 0.8,
+    "db": -14
+   },
+   {
+    "clip": "el_slowmo_2",
+    "at": "fbs",
+    "offset": 0,
+    "db": -22,
+    "dur": 1.5,
+    "fout": 0.3
+   },
+   {
+    "clip": "s3_fire_b",
+    "at": "fbs",
+    "offset": 0.4,
+    "db": -16
+   },
+   {
+    "clip": "s2_bed",
+    "at": "aig",
+    "offset": 0,
+    "db": -21,
+    "fin": 0.2,
+    "fout": 0.4,
+    "until": "r0"
+   },
+   {
+    "clip": "s3_gate",
+    "at": "aig",
+    "offset": 0.1,
+    "db": -20,
+    "fin": 0.3
+   },
+   {
+    "clip": "s3_ward",
+    "at": "aiw",
+    "offset": 0.1,
+    "db": -19
+   },
+   {
+    "clip": "s3_quake_b",
+    "at": "r0",
+    "offset": 0,
+    "db": -17,
+    "dur": 0.4,
+    "fout": 0.1
+   },
+   {
+    "clip": "s3_blink",
+    "at": "r1",
+    "offset": 0,
+    "db": -18,
+    "dur": 0.4,
+    "fout": 0.1
+   },
+   {
+    "clip": "s3_wardhit",
+    "at": "r2",
+    "offset": 0,
+    "db": -17,
+    "dur": 0.4,
+    "fout": 0.1
+   },
+   {
+    "clip": "s3_fire_b",
+    "at": "r3",
+    "offset": 0,
+    "db": -17,
+    "dur": 0.5,
+    "fout": 0.15
+   },
+   {
+    "clip": "logo_hit",
+    "at": "end",
+    "offset": 0,
+    "db": -19
+   },
+   {
+    "clip": "s3_gate",
+    "at": "end",
+    "offset": 0.2,
+    "db": -24,
+    "fin": 0.3
+   },
+   {
+    "clip": "s3_gate_b",
+    "at": "end",
+    "offset": 3.75,
+    "db": -20
+   }
+  ],
+  "music": {
+   "clip": "music",
+   "db": -24
+  }
+ }
+}

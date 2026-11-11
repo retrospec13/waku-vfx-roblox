@@ -8,7 +8,8 @@ ROOT = Path(__file__).resolve().parents[1]
 MODULES = ['Kit', 'Assets', 'CasterState', 'Pose', 'SelfTest',
            'Effects/PrismCleave', 'Effects/CrystalBloom', 'Effects/StormLance',
            'Effects/EarthRise', 'Effects/ChargeAura', 'Effects/HitBurst', 'Effects/ChargeBeam',
-           'Effects/GhostDash', 'Effects/ImpactFlash', 'init']
+           'Effects/GhostDash', 'Effects/ImpactFlash', 'Effects/QuakeSlam', 'Effects/BlinkStep',
+           'Effects/RiftGate', 'Effects/WardShell', 'Effects/Fireball', 'init']
 
 def main():
     chunks = [(ROOT / 'tests/mocks.luau').read_text()]

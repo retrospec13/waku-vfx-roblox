@@ -1,0 +1,9 @@
+{
+  "name": "wakuvfx_dev",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": { "wakuVFX": { "$path": "src/wakuVFX" } },
+    "ServerScriptService": { "Stage": { "$path": "src/dev/Stage.server.luau" } },
+    "StarterPlayer": { "StarterPlayerScripts": { "Harness": { "$path": "src/dev/Harness.client.luau" } } }
+  }
+}

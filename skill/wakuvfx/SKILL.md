@@ -16,6 +16,13 @@ for a complete visible effect and exact registration/test steps.
   scale/rainbow/hue. Do not silently restyle accepted art to change that.
 - ChargeBeam also poses its caster. ChargeAura, GhostDash and ImpactFlash read
   the caster but never pose or modify it. GhostDash does not move anyone.
+- QuakeSlam, BlinkStep, RiftGate, WardShell and Fireball never pose or lock the
+  caster. BlinkStep hides it for the gap (CasterState) and needs opts.to or the
+  game to move the root; it moves nobody itself.
+- Long-lived effects with a closing animation set ctx.outro in build and read
+  ctx.stopAt in update: handle.stop() then plays the close (RiftGate, WardShell).
+- Use Kit.seq(ctx, ...) instead of Kit.hueSeq for any gradient that should turn
+  single-hue when rainbow=false (Fireball does this throughout).
 - Kit.plate (flat card at any angle), Kit.sprite (camera-facing card) and
   Kit.rightTo (beam curve handles) cover most new layers without new parts.
 - Emit each ParticleEmitter once per frame: several Emit(1) calls with the host
@@ -25,6 +32,7 @@ for a complete visible effect and exact registration/test steps.
 - Use Kit.part for anchored noncolliding geometry. Keep hot core, rainbow body
   and dark contrast. Register cleanup BEFORE changing anything outside ctx.root.
 - Use the keyed casters example in TESTS.md, with timeScale=1 and real R15 rigs.
-- timeScale=0 is a screenshot freeze, not a fixed-step API. No capture harness,
-  trailer authoring pipeline or dev-harness step command ships with this kit.
+- timeScale=0 is a screenshot freeze, not a fixed-step API. The owner's capture
+  and trailer pipeline (tools/wakupipe.py, docs/PIPELINE.md) is separate from
+  the runtime and needs the Windows capture PC.
 - Network gameplay belongs to the recipient. This library is visual only.

@@ -35,6 +35,11 @@
 	  waku.play("ChargeBeam", hrp.CFrame, { caster = character })       -- gather, then a thick beam along LookVector
 	  waku.play("GhostDash", hrp.CFrame, { caster = character })        -- afterimages + trail; the game moves the caster
 	  waku.play("ImpactFlash", CFrame.lookAt(contact, contact + blowDir), { caster = character }) -- B/W impact frame
+	  waku.play("QuakeSlam", CFrame.new(groundPos))                     -- giant ground slam, cracks, flying rock
+	  waku.play("BlinkStep", hrp.CFrame, { caster = character, to = arrivePos }) -- vanish, thunderclap arrival; the game moves the caster
+	  local gate = waku.play("RiftGate", CFrame.lookAt(centre, centre + facing)) -- portal; gate.stop() folds it shut (4.7 s if left)
+	  local ward = waku.play("WardShell", hrp.CFrame, { caster = character }) -- guard bubble; ward.stop() shatters it (3.4 s if left)
+	  waku.play("Fireball", hrp.CFrame)                                 -- house-sized fireball along LookVector; { rainbow = false, hue = 0.03 } = orange
 
 	Options vary by effect; see README. Same-caster posed overlap returns nil and records a build error.
 	Everything runs on ONE Heartbeat connection and one effect clock (waku.now). waku.timeScale: nil = real time,
@@ -79,11 +84,17 @@ waku.Effects = {
 	ChargeBeam = require(script.Effects.ChargeBeam) :: Spec,
 	GhostDash = require(script.Effects.GhostDash) :: Spec,
 	ImpactFlash = require(script.Effects.ImpactFlash) :: Spec,
+	QuakeSlam = require(script.Effects.QuakeSlam) :: Spec,
+	BlinkStep = require(script.Effects.BlinkStep) :: Spec,
+	RiftGate = require(script.Effects.RiftGate) :: Spec,
+	WardShell = require(script.Effects.WardShell) :: Spec,
+	Fireball = require(script.Effects.Fireball) :: Spec,
 }
-waku.Order = { "PrismCleave", "CrystalBloom", "StormLance", "EarthRise", "ChargeAura", "HitBurst", "ChargeBeam", "GhostDash", "ImpactFlash" }
+waku.Order = { "PrismCleave", "CrystalBloom", "StormLance", "EarthRise", "ChargeAura", "HitBurst", "ChargeBeam", "GhostDash", "ImpactFlash",
+	"QuakeSlam", "BlinkStep", "RiftGate", "WardShell", "Fireball" }
 waku.SelfTest = require(script.SelfTest)
 
-export type Options = { rainbow: boolean?, hue: number?, scale: number?, caster: Model?, seed: number?, grade: boolean? }
+export type Options = { rainbow: boolean?, hue: number?, scale: number?, caster: Model?, seed: number?, grade: boolean?, to: Vector3? }
 export type Handle = { name: string, root: Model, t0: number, life: number, stop: () -> (), alive: () -> boolean }
 
 type Running = { handle: Handle, ctx: Kit.Ctx, update: (number) -> (), ended: boolean }
@@ -167,6 +178,7 @@ function waku.play(name: string, cf: CFrame, opts: Options?): Handle?
 		caster = o.caster,
 		seed = o.seed or 7,
 		grade = o.grade,
+		to = o.to,
 	})
 	local r: Running
 	local handle: Handle = {
@@ -175,7 +187,16 @@ function waku.play(name: string, cf: CFrame, opts: Options?): Handle?
 		t0 = t0,
 		life = spec.life,
 		stop = function()
-			if r then
+			if not r or r.ended then
+				return
+			end
+			-- effects with a closing animation (ctx.outro) play it once; a second stop() ends them at once
+			local outro = ctx.outro
+			local t = waku.now() - t0
+			if outro and ctx.stopAt == nil and t + outro < r.handle.life then
+				ctx.stopAt = t
+				r.handle.life = t + outro
+			else
 				finish(r)
 			end
 		end,
@@ -293,7 +314,7 @@ return {
         <Properties>
           <string name="Name">CasterState</string>
           <string name="Source"><![CDATA[--!strict
--- One pose owner per original caster, shared by Pose and EarthRise.
+-- One pose owner per original caster, shared by Pose, EarthRise and BlinkStep.
 -- A second posed effect fails cleanly instead of snapshotting an already hidden rig.
 local Players = game:GetService("Players")
 local CasterState = {}
@@ -357,6 +378,49 @@ function CasterState.clone(ctx: any, caster: Model): Model
 	return clone
 end
 
+-- Hide a caster in place for part of an effect (BlinkStep): no clone, no anchoring, no reparenting, so the game can
+-- keep moving the character. Takes the same one-owner lock as clone(); returns hide() and restore(). restore() also
+-- runs from the effect's cleanup, so a stopped or failed effect never leaves the caster invisible.
+function CasterState.hider(ctx: any, caster: Model): (() -> (), () -> ())
+	if owners[caster] then
+		error("caster already has an active pose; stop the previous handle first")
+	end
+	local token = {}
+	owners[caster] = token
+	local hidden: { [Instance]: number } = {}
+	local released = false
+	local function show()
+		for d, tr in hidden do
+			if d.Parent then
+				(d :: any).Transparency = tr
+			end
+		end
+		table.clear(hidden)
+	end
+	local function restore()
+		show()
+		if not released then
+			released = true
+			if owners[caster] == token then
+				owners[caster] = nil
+			end
+		end
+	end
+	table.insert(ctx.cleanups, restore)
+	local function hide()
+		if released or next(hidden) ~= nil then
+			return
+		end
+		for _, d in caster:GetDescendants() do
+			if d:IsA("BasePart") or d:IsA("Decal") then
+				hidden[d] = (d :: any).Transparency;
+				(d :: any).Transparency = 1
+			end
+		end
+	end
+	return hide, restore
+end
+
 return CasterState
 ]]></string>
         </Properties>
@@ -366,6 +430,392 @@ return CasterState
           <string name="Name">Effects</string>
         </Properties>
         <Item class="ModuleScript" referent="7">
+          <Properties>
+            <string name="Name">BlinkStep</string>
+            <string name="Source"><![CDATA[--!strict
+--[[ BlinkStep: a combat blink. Gone in a seam of light, back in a thunderclap.
+	cf = the leave point (the caster's root CFrame). The arrive point is, in order: opts.to (where the root will be),
+	else wherever opts.caster's root is when the gap ends (the game moved it), else 18 studs along cf.LookVector.
+	Visuals only: the game moves the character. With opts.caster the body is hidden for the gap and restored on
+	arrival (CasterState), and restored by cleanup if the effect is stopped early.
+
+	0.00-0.16  leave: the body whites out and is pulled into a tall, thin seam of light; rings snap shut on the spot
+	0.16       the seam pinches closed: one tight star, a small ring of dust. Nothing else is left behind
+	0.16-0.31  gap: the caster is hidden; a thin leader of lightning finds the arrive point and a ring closes on it
+	0.31       arrive: a pillar of lightning drops out of the sky, white-out flash, shock rings, cracked ground,
+	           black lightning; the caster is back, white-hot, and cools over the next quarter second
+	0.31-0.85  the pillar thins, the rings roll out, the cracks cool
+	No ghost copies and no dash trail: that is GhostDash. ]]
+local Workspace = game:GetService("Workspace")
+local Kit = require(script.Parent.Parent.Kit)
+local CasterState = require(script.Parent.Parent.CasterState)
+
+local LEAVE = 0.16
+local ARRIVE = 0.31
+local UP = Vector3.yAxis
+
+local BlinkStep = {
+	life = 0.85,
+	required = { "glow_soft", "spark_streak", "spark_glint", "shock_ring", "ground_crack", "bolt_glow", "smoke_puff" },
+}
+
+local function seq2(a: number, b: number): NumberSequence
+	return NumberSequence.new({ NumberSequenceKeypoint.new(0, math.clamp(a, 0, 1)), NumberSequenceKeypoint.new(1, math.clamp(b, 0, 1)) })
+end
+local function seq3(a: number, m: number, b: number): NumberSequence
+	return NumberSequence.new({ NumberSequenceKeypoint.new(0, math.clamp(a, 0, 1)), NumberSequenceKeypoint.new(0.5, math.clamp(m, 0, 1)),
+		NumberSequenceKeypoint.new(1, math.clamp(b, 0, 1)) })
+end
+
+function BlinkStep.build(ctx: Kit.Ctx): (number) -> ()
+	local S = ctx.opts.scale
+	local rng = ctx.rng
+	local seed = ctx.opts.seed
+	local caster = ctx.opts.caster
+	local hrp = caster and caster:FindFirstChild("HumanoidRootPart")
+	local rootPart: BasePart? = if hrp and hrp:IsA("BasePart") then hrp else nil
+
+	local hide: (() -> ())? = nil
+	local restore: (() -> ())? = nil
+	if caster then
+		hide, restore = CasterState.hider(ctx, caster)
+	end
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local ex: { Instance } = { ctx.root }
+	if caster then
+		table.insert(ex, caster)
+	end
+	local folder = Workspace:FindFirstChild("wakuVFX")
+	if folder then
+		table.insert(ex, folder)
+	end
+	params.FilterDescendantsInstances = ex
+
+	local A = if rootPart then rootPart.Position else ctx.cf.Position
+	local hitA = Workspace:Raycast(A, -UP * 14 * S, params)
+	local drop = if hitA then A.Y - hitA.Position.Y else 3 * S
+	local GA = A - UP * (drop - 0.08)
+	local fallback = A + ctx.cf.LookVector * 18 * S
+	local B = ctx.opts.to or fallback -- latched at ARRIVE
+	local GB = B - UP * (drop - 0.08)
+	local latched = false
+	local function target(): Vector3
+		if ctx.opts.to then
+			return ctx.opts.to
+		elseif rootPart and rootPart.Parent then
+			return rootPart.Position
+		end
+		return fallback
+	end
+
+	-- the body whites out before it goes, and comes back white-hot
+	local glow: Highlight? = nil
+	if caster then
+		local hl = Instance.new("Highlight")
+		hl.Name = "BlinkGlow"
+		hl.Adornee = caster
+		hl.DepthMode = Enum.HighlightDepthMode.Occluded
+		hl.FillColor = Color3.new(1, 1, 1)
+		hl.FillTransparency = 1
+		hl.OutlineTransparency = 1
+		hl.Parent = ctx.root
+		glow = hl
+	end
+
+	-- leave: the seam -------------------------------------------------------------------------------------------
+	local sA0, sA1 = Kit.att(ctx), Kit.att(ctx)
+	local seamInk = Kit.beam(ctx, sA0, sA1, "bolt_glow", -1)
+	seamInk.Name = "SeamInk"
+	seamInk.LightEmission = 0
+	local seam = Kit.beam(ctx, sA0, sA1, "bolt_glow", 1)
+	seam.Name = "Seam"
+	local seamCore = Kit.beam(ctx, sA0, sA1, "bolt_glow", 2)
+	seamCore.Name = "SeamCore"
+	seamCore.Brightness = 3
+	for _, b in { seamInk, seam, seamCore } do
+		b.Segments = 1
+		b.Enabled = false
+	end
+	local inRings = { Kit.plate(ctx, "InRing", "shock_ring", 1), Kit.plate(ctx, "InRing", "shock_ring", 1) }
+	local bodyGlow = Kit.sprite(ctx, "BodyGlow", "glow_soft", 3)
+	local pinch = Kit.sprite(ctx, "Pinch", "spark_glint", 5)
+	local pinchLine = Kit.sprite(ctx, "PinchLine", "spark_glint", 5)
+	local leaveRing = Kit.flat(ctx, "LeaveRing", { tex = "shock_ring", life = 0.2, size = { { 0, 2 }, { 1, 15 } },
+		transp = { { 0, 0.1 }, { 1, 1 } }, bright = 2, z = 1 })
+	local streakIn = Kit.burst(ctx, "StreakIn", { tex = "spark_streak", life = { 0.07, 0.11 }, size = { { 0, 0.3 }, { 0.4, 2.2 }, { 1, 0.2 } },
+		transp = { { 0, 1 }, { 0.3, 0 }, { 1, 0.4 } }, speed = { 70, 110 }, rot = { 90 }, vpar = true, bright = 2.5 })
+	local leaveDust = Kit.burst(ctx, "LeaveDust", { tex = "smoke_puff", life = { 0.25, 0.4 }, size = { { 0, 0.8 }, { 1, 3.2 } },
+		transp = { { 0, 0.5 }, { 1, 1 } }, speed = { 14, 26 }, drag = 5, rot = { 0, 360 }, le = 0 })
+
+	-- gap: the leader ---------------------------------------------------------------------------------------------
+	local leader = Kit.bolt(ctx, "Leader", 8, 2, 1)
+	local leaderGlow = Kit.bolt(ctx, "LeaderGlow", 8, 1, 1)
+	local preRing = Kit.plate(ctx, "PreRing", "shock_ring", 1)
+	local preGlow = Kit.sprite(ctx, "PreGlow", "glow_soft", 3)
+
+	-- arrive ------------------------------------------------------------------------------------------------------
+	local pA0, pA1 = Kit.att(ctx), Kit.att(ctx)
+	local pillarInk = Kit.beam(ctx, pA0, pA1, "bolt_glow", -1)
+	pillarInk.Name = "PillarInk"
+	pillarInk.LightEmission = 0
+	local pillar = Kit.beam(ctx, pA0, pA1, "bolt_glow", 1)
+	pillar.Name = "Pillar"
+	local pillarCore = Kit.beam(ctx, pA0, pA1, "bolt_glow", 2)
+	pillarCore.Name = "PillarCore"
+	pillarCore.Brightness = 3
+	for _, b in { pillarInk, pillar, pillarCore } do
+		b.Segments = 1
+		b.Enabled = false
+	end
+	local flash = Kit.sprite(ctx, "Flash", "glow_soft", 6)
+	local star = Kit.sprite(ctx, "Star", "spark_glint", 7)
+	local star2 = Kit.sprite(ctx, "Star2", "spark_glint", 7)
+	local upRings = { Kit.plate(ctx, "UpRing", "shock_ring", 2), Kit.plate(ctx, "UpRing", "shock_ring", 2), Kit.plate(ctx, "UpRing", "shock_ring", 2) }
+	local shock1 = Kit.flat(ctx, "Shock", { tex = "shock_ring", life = 0.36, size = { { 0, 3 }, { 0.25, 26 }, { 1, 46 } },
+		transp = { { 0, 0 }, { 0.5, 0.3 }, { 1, 1 } }, bright = 2.5, z = 2 })
+	local shock2 = Kit.flat(ctx, "Shock2", { tex = "shock_ring", life = 0.42, size = { { 0, 2 }, { 0.3, 17 }, { 1, 30 } },
+		transp = { { 0, 0.1 }, { 0.5, 0.35 }, { 1, 1 } }, bright = 2, spin = 90, z = 2 })
+	local shockInk = Kit.flat(ctx, "ShockInk", { tex = "shock_ring", life = 0.4, size = { { 0, 4 }, { 0.25, 30 }, { 1, 52 } },
+		transp = { { 0, 0.1 }, { 0.6, 0.45 }, { 1, 1 } }, le = 0, z = 1 })
+	local crack = Kit.flat(ctx, "CrackDark", { tex = "ground_crack", life = 0.52, size = { { 0, 4 }, { 0.1, 17 }, { 1, 18 } },
+		transp = { { 0, 0 }, { 0.6, 0.15 }, { 1, 1 } }, le = 0, rot = rng:NextNumber(0, 360), z = 0.4 })
+	local crackHot = Kit.flat(ctx, "CrackHot", { tex = "ground_crack", life = 0.45, size = { { 0, 4 }, { 0.12, 17 }, { 1, 18 } },
+		transp = { { 0, 0 }, { 0.4, 0.25 }, { 1, 1 } }, bright = 3, rot = rng:NextNumber(0, 360), z = 0.8 })
+	local bolts = {}
+	for i = 1, 5 do
+		bolts[i] = { glow = Kit.bolt(ctx, "HakiGlow", 5, 1, 1), core = Kit.bolt(ctx, "HakiCore", 5, 2, 0) }
+	end
+	local dust = Kit.burst(ctx, "Dust", { tex = "smoke_puff", life = { 0.35, 0.55 }, size = { { 0, 1.6 }, { 1, 6.5 } },
+		transp = { { 0, 0.35 }, { 0.5, 0.65 }, { 1, 1 } }, speed = { 34, 62 }, drag = 4, rot = { 0, 360 }, rotSpeed = { -80, 80 }, le = 0 })
+	local sparks = Kit.burst(ctx, "Sparks", { tex = "spark_streak", life = { 0.2, 0.42 }, size = { { 0, 0.4 }, { 0.2, 2.2 }, { 1, 0.2 } },
+		transp = { { 0, 0 }, { 0.6, 0.15 }, { 1, 1 } }, speed = { 45, 105 }, spread = 70, drag = 3, acc = Vector3.new(0, -70 * S, 0),
+		rot = { 90 }, vpar = true, bright = 2.5 })
+	local lines = Kit.burst(ctx, "SpeedLines", { tex = "spark_streak", life = { 0.1, 0.16 }, size = { { 0, 0.6 }, { 0.3, 4.4 }, { 1, 0.4 } },
+		transp = { { 0, 0.1 }, { 0.6, 0.3 }, { 1, 1 } }, speed = { 110, 170 }, rot = { 90 }, vpar = true, bright = 2 })
+	local glints = Kit.burst(ctx, "Glints", { tex = "spark_glint", life = { 0.18, 0.4 }, size = { { 0, 0 }, { 0.2, 1.7 }, { 1, 0 } },
+		speed = { 14, 40 }, drag = 4, rot = { 0, 360 }, rotSpeed = { -160, 160 }, bright = 3 })
+
+	local grade = Kit.grade(ctx)
+	local lightPart = Kit.part(ctx, ctx.root, "Light", Vector3.one * 0.2, Color3.new(), Enum.Material.SmoothPlastic)
+	lightPart.Transparency = 1
+	local light = Kit.light(ctx, lightPart, 36 * S)
+
+	local once = Kit.once()
+	local nIn = 0
+
+	return function(t: number)
+		local h = Kit.hue(ctx, t, 0)
+		local ta = t - ARRIVE
+
+		-- caster: white out, vanish, come back hot ---------------------------------------------------------------
+		if once("hide", t, LEAVE) and hide then
+			hide()
+		end
+		if once("latch", t, ARRIVE) then
+			B = target()
+			local hb = Workspace:Raycast(B, -UP * 14 * S, params)
+			GB = if hb then hb.Position + UP * 0.08 else B - UP * (drop - 0.08)
+			latched = true
+			if restore then
+				restore()
+			end
+		end
+		if not latched then
+			B = target()
+			GB = B - UP * (drop - 0.08)
+		end
+		if glow then
+			if t < LEAVE then
+				glow.Enabled = true
+				glow.FillColor = Kit.hot(h)
+				glow.FillTransparency = 1 - Kit.easeOut(t / (LEAVE * 0.7))
+			elseif t < ARRIVE then
+				glow.Enabled = false
+			else
+				glow.Enabled = ta < 0.3
+				glow.FillColor = Kit.hot(h)
+				glow.FillTransparency = Kit.easeIn(Kit.ramp(ta, 0.04, 0.3))
+				glow.OutlineColor = Kit.col(h, 0.7, 1)
+				glow.OutlineTransparency = Kit.ramp(ta, 0, 0.3)
+			end
+		end
+
+		-- leave: the body is drawn into a seam -----------------------------------------------------------------------
+		local lu = Kit.ramp(t, 0, LEAVE)
+		local fadeS = Kit.ramp(t, LEAVE, LEAVE + 0.11) -- the seam after it pinches shut
+		if fadeS < 1 then
+			local tall = (5 + 30 * Kit.easeIn(lu) + 26 * fadeS) * S
+			local wide = (5.5 * (1 - Kit.easeOut(lu)) + 1.3) * (1 - fadeS) * S
+			sA0.CFrame = CFrame.new(A - UP * math.min(drop, tall * 0.3))
+			sA1.CFrame = CFrame.new(A + UP * tall)
+			local a = 0.85 * (1 - lu) * (1 - lu)
+			seamInk.Width0, seamInk.Width1 = wide * 2.6, 0
+			seamInk.Color = ColorSequence.new(Kit.ink(h))
+			seamInk.Transparency = seq3(0.3 + a, 0.3 + a, 1)
+			seam.Width0, seam.Width1 = wide * 1.6, 0
+			seam.Color = Kit.seq(ctx, h, 0.7, 0.85, 1, 6)
+			seam.Transparency = seq3(a, a, 1)
+			seamCore.Width0, seamCore.Width1 = wide * 0.6, 0
+			seamCore.Color = ColorSequence.new(Kit.hot(h))
+			seamCore.Transparency = seq3(a * 0.6, a * 0.6, 1)
+			seamInk.Enabled, seam.Enabled, seamCore.Enabled = true, true, true
+		else
+			seamInk.Enabled, seam.Enabled, seamCore.Enabled = false, false, false
+		end
+		for i, ring in inRings do
+			local u = Kit.ramp(t, (i - 1) * 0.05, LEAVE)
+			ring.beam.Color = Kit.seq(ctx, Kit.hue(ctx, t, i * 0.3), 0.4, 0.8, 1, 4)
+			ring.set(GA, UP, (20 - 18.5 * Kit.easeIn(u)) * S, if u <= 0 or t >= LEAVE then 1 else 0.7 - 0.6 * u, t * 7 + i)
+		end
+		bodyGlow.beam.Color = ColorSequence.new(Kit.hot(h))
+		bodyGlow.set(A, (11 - 7 * lu) * S, if t < LEAVE then 0.75 - 0.6 * lu else 1)
+		if t < LEAVE - 0.03 then
+			local want = math.floor(t / 0.012)
+			if want > nIn then
+				nIn = want
+				streakIn.Color = ColorSequence.new(Kit.col(Kit.hue(ctx, t, rng:NextNumber()), 0.7, 1), Kit.hot(h))
+				for _ = 1, 3 do
+					local d = Vector3.new(rng:NextNumber(-1, 1), rng:NextNumber(-0.5, 0.9), rng:NextNumber(-1, 1)).Unit
+					local p = A + d * rng:NextNumber(7, 10) * S
+					ctx.host.CFrame = Kit.upTo(p, A - p)
+					streakIn:Emit(1)
+				end
+			end
+		end
+		if once("pinch", t, LEAVE) then
+			leaveRing.fire(LEAVE, GA, Kit.seq(ctx, h, 0.5, 0.6, 1, 4))
+			Kit.spray(ctx, leaveDust, GA + UP * 0.6 * S, 10, ColorSequence.new(Color3.fromHSV(h, 0.14, 0.6)), "disc", 1, 0.1)
+			Kit.spray(ctx, glints, A, 6, ColorSequence.new(Kit.hot(h), Kit.col(h)), "sphere", 1)
+		end
+		leaveRing.update(t)
+		local pk = if t >= LEAVE then 1 - Kit.ramp(t, LEAVE, LEAVE + 0.09) else 0
+		pinch.beam.Color = ColorSequence.new(Color3.new(1, 1, 1))
+		pinch.set(A, 20 * S * pk, if pk > 0 then 0 else 1, 0.4, 1)
+		pinchLine.beam.Color = ColorSequence.new(Kit.hot(h + 0.3))
+		pinchLine.set(A, 9 * S * pk, if pk > 0 then 0 else 1, math.pi / 2, 7) -- a wide horizontal cut
+
+		-- gap: a leader finds the arrive point -----------------------------------------------------------------------
+		local gu = Kit.ramp(t, LEAVE - 0.02, ARRIVE)
+		if gu > 0 and t < ARRIVE then
+			local top = B + UP * 110 * S + Vector3.new(14, 0, -9) * S
+			local reach = top:Lerp(GB, Kit.easeOut(Kit.ramp(gu, 0, 0.75)))
+			local sd = seed * 37 + math.floor(t / 0.035)
+			leaderGlow.set(top, reach, 2.4 * S, 0.035, sd, Kit.col(Kit.hue(ctx, t, 0.3), 0.85, 1), 0.3)
+			leader.set(top, reach, 0.8 * S, 0.035, sd, Kit.hot(h), 0)
+			preRing.beam.Color = Kit.seq(ctx, h, 0.8, 0.85, 1, 6)
+			preRing.set(GB, UP, (24 - 21 * Kit.easeIn(gu)) * S, 0.75 - 0.65 * gu, -t * 9)
+			preGlow.beam.Color = ColorSequence.new(Kit.col(h + 0.15, 0.5, 1))
+			preGlow.set(B, (3 + 9 * gu) * S, 0.8 - 0.6 * gu)
+		else
+			leader.hide()
+			leaderGlow.hide()
+			preRing.hide()
+			preGlow.hide()
+		end
+
+		-- arrive -------------------------------------------------------------------------------------------------------
+		if once("arrive", t, ARRIVE) then
+			shock1.fire(ARRIVE, GB, Kit.seq(ctx, h, 0.7, 0.55, 1, 6))
+			shockInk.fire(ARRIVE, GB, ColorSequence.new(Kit.ink(h)))
+			crack.fire(ARRIVE, GB + UP * 0.02, ColorSequence.new(Color3.fromHSV((h + 0.6) % 1, 0.5, 0.05)))
+			crackHot.fire(ARRIVE, GB + UP * 0.03, Kit.seq(ctx, h, 0.8, 0.6, 1, 6))
+			local dustCol = ColorSequence.new(Color3.fromHSV(h, 0.16, 0.62), Color3.fromHSV(h, 0.1, 0.4))
+			Kit.spray(ctx, dust, GB + UP * S, 28, dustCol, "disc", 2, 0.08)
+			Kit.spray(ctx, sparks, GB + UP * 0.5 * S, 42, ColorSequence.new(Kit.hot(h), Kit.col(h + 0.25, 0.8, 1)), "point", 0, 0, UP)
+			Kit.spray(ctx, lines, GB + UP * 0.7 * S, 26, ColorSequence.new(Kit.hot(h), Kit.col(h + 0.4, 0.7, 1)), "disc", 3, 0.05)
+			Kit.spray(ctx, glints, B, 22, ColorSequence.new(Kit.hot(h), Kit.col(h + 0.15)), "sphere", 3)
+		end
+		if once("shock2", t, ARRIVE + 0.06) then
+			shock2.fire(ARRIVE + 0.06, GB, Kit.seq(ctx, h + 0.3, 0.6, 0.7, 1, 5))
+		end
+		shock1.update(t)
+		shock2.update(t)
+		shockInk.update(t)
+		crack.update(t)
+		crackHot.update(t)
+
+		local arrived = ta >= 0
+		local f = if arrived then 1 - Kit.ramp(ta, 0, 0.12) else 0
+		flash.beam.Color = ColorSequence.new(Kit.hot(h))
+		flash.set(B, (16 + 44 * f) * S, 1 - f)
+		star.beam.Color = ColorSequence.new(Color3.new(1, 1, 1))
+		star.set(B, 56 * S * f, if f > 0 then 0 else 1, 0.35, 1)
+		star2.beam.Color = ColorSequence.new(Kit.hot(h + 0.3))
+		star2.set(B, 36 * S * f, if f > 0 then 0.1 else 1, 0.35 + math.pi / 4 + ta * 5, 1)
+
+		local pu = Kit.ramp(ta, 0, 0.34)
+		if arrived and pu < 1 then
+			local thin = (1 - pu) ^ 1.8
+			pA0.CFrame = CFrame.new(GB)
+			pA1.CFrame = CFrame.new(GB + UP * 120 * S)
+			pillarInk.Width0, pillarInk.Width1 = 15 * thin * S, 8 * thin * S
+			pillarInk.Color = ColorSequence.new(Kit.ink(h))
+			pillarInk.Transparency = seq2(0.2 + 0.5 * pu, 0.9)
+			pillar.Width0, pillar.Width1 = 10 * thin * S, 5 * thin * S
+			pillar.Color = Kit.seq(ctx, h, 0.7, 0.85, 1, 6)
+			pillar.Transparency = seq2(0.1 + 0.5 * pu, 0.85)
+			pillarCore.Width0, pillarCore.Width1 = 4 * thin * S, 1.6 * thin * S
+			pillarCore.Color = ColorSequence.new(Kit.hot(h))
+			pillarCore.Transparency = seq2(0.4 * pu, 0.8)
+			pillarInk.Enabled, pillar.Enabled, pillarCore.Enabled = true, true, true
+		else
+			pillarInk.Enabled, pillar.Enabled, pillarCore.Enabled = false, false, false
+		end
+		for i, ring in upRings do
+			local u = Kit.ramp(ta, 0.01 + (i - 1) * 0.04, 0.3 + (i - 1) * 0.07)
+			ring.beam.Color = Kit.seq(ctx, Kit.hue(ctx, t, i * 0.25), 0.5, 0.7, 1, 5)
+			Kit.pulse(ring, GB + UP * (5 + 10 * i) * S, UP, u, 4 * S, (36 - 7 * i) * S, 0.1, i * 2)
+		end
+
+		local slot = math.floor(t / 0.045)
+		local alive = if arrived then 1 - Kit.ramp(ta, 0.05, 0.36) else 0
+		for i, b in bolts do
+			local r = Random.new(seed * 131 + i * 977 + slot * 31)
+			if alive > 0 and r:NextNumber() < 0.3 + 0.65 * alive then
+				local a = r:NextNumber(0, math.pi * 2)
+				local el = r:NextNumber(0.1, 1.2)
+				local tip = B + (Vector3.new(math.cos(a), 0, math.sin(a)) * math.cos(el) + UP * math.sin(el)) * r:NextNumber(9, 20) * S
+				local sd = seed * 53 + i * 101 + slot
+				b.glow.set(B, tip, 2.6 * S, 0.11, sd, Kit.col(Kit.hue(ctx, t, i / #bolts), 0.9, 1), 0.25)
+				b.core.set(B, tip, 0.85 * S, 0.11, sd, Color3.new(0, 0, 0), 0)
+			else
+				b.glow.hide()
+				b.core.hide()
+			end
+		end
+
+		if grade then
+			local k1 = if arrived then math.exp(-ta * 24) else 0
+			local k2 = if arrived then math.exp(-ta * 7) else 0
+			local dim = if t < ARRIVE then Kit.ramp(t, 0, LEAVE) else 0 -- the world dips a little while they are gone
+			grade.Brightness = 0.35 * k1 - 0.08 * dim
+			grade.Contrast = 0.35 * k2 + 0.1 * dim
+			grade.Saturation = 0.3 * k2
+		end
+		lightPart.CFrame = CFrame.new(if arrived then B else A)
+		light.Color = Kit.col(h, 0.4, 1)
+		light.Brightness = if arrived then 8 * math.exp(-ta * 8) elseif t < LEAVE then 3 * lu else 3 * (1 - fadeS)
+	end
+end
+
+-- a tick when the seam shuts, a real kick on arrival
+function BlinkStep.shake(t: number): Vector3
+	local k = 0
+	if t >= ARRIVE then
+		k = 0.8 * math.exp(-(t - ARRIVE) * 10)
+	elseif t >= LEAVE then
+		k = 0.15 * math.exp(-(t - LEAVE) * 25)
+	end
+	return Vector3.new(math.sin(t * 91) * k * 0.6, math.cos(t * 113) * k, 0)
+end
+
+return BlinkStep
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="8">
           <Properties>
             <string name="Name">ChargeAura</string>
             <string name="Source"><![CDATA[--!strict
@@ -727,7 +1177,7 @@ return ChargeAura
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="8">
+        <Item class="ModuleScript" referent="9">
           <Properties>
             <string name="Name">ChargeBeam</string>
             <string name="Source"><![CDATA[--!strict
@@ -1199,7 +1649,7 @@ return ChargeBeam
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="9">
+        <Item class="ModuleScript" referent="10">
           <Properties>
             <string name="Name">CrystalBloom</string>
             <string name="Source"><![CDATA[--!strict
@@ -1544,7 +1994,7 @@ return CrystalBloom
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="10">
+        <Item class="ModuleScript" referent="11">
           <Properties>
             <string name="Name">EarthRise</string>
             <string name="Source"><![CDATA[--!strict
@@ -2207,7 +2657,558 @@ return EarthRise
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="11">
+        <Item class="ModuleScript" referent="12">
+          <Properties>
+            <string name="Name">Fireball</string>
+            <string name="Source"><![CDATA[--!strict
+--[[ Fireball: a thrown fireball the size of a small house.
+	cf = the caster's root CFrame; the ball flies along cf.LookVector and stops at the first thing it hits within
+	60 studs (it bursts in mid-air at full range). It never poses or touches the caster.
+
+	0.00-0.20  charge flare: rings and streaks fall into a point in front of the caster, a star swells there
+	0.20       launch: muzzle star, a ring kicked back off the launch, dust
+	0.20-~0.8  flight (0.4 s point blank .. 0.65 s at full range): a white-hot core in a burning shell with a dark
+	           halo and a turning star, a long tapering flame tail (dark edge, colour body, white heart), two flame
+	           ribbons winding round it, sonic rings shed along the path, flame puffs, dark smoke and embers behind
+	impact     0.4 s burst: flash and star, a fire dome that swells and thins, a ring of spikes, shock rings on the
+	           surface, sparks that fall, black lightning, rolling fire and rising smoke
+	..1.60     a scorch ring and glowing cracks cool on whatever it hit, small flames still licking
+
+	Rainbow by default like the rest of the kit; { rainbow = false, hue = 0.05 } is plain orange fire. ]]
+local Workspace = game:GetService("Workspace")
+local Kit = require(script.Parent.Parent.Kit)
+
+local CHARGE = 0.2
+local BURST = 0.4
+local UP = Vector3.yAxis
+
+local Fireball = {
+	life = 1.6,
+	required = { "glow_soft", "spark_streak", "spark_glint", "shock_ring", "ground_crack", "ground_disc", "bolt_glow", "smoke_puff", "slash_body" },
+}
+
+local lastHit = CHARGE + 0.5 -- when the last cast landed (camera shake reads it)
+
+function Fireball.build(ctx: Kit.Ctx): (number) -> ()
+	local S = ctx.opts.scale
+	local rng = ctx.rng
+	local seed = ctx.opts.seed
+	local rainbow = ctx.opts.rainbow
+	local life = Fireball.life
+	local span = if rainbow then 1 else 0.1
+	local dir = ctx.cf.LookVector
+	local M = ctx.cf.Position + dir * 3 * S + UP * 0.5 * S
+	local RANGE = 60 * S
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local ex: { Instance } = { ctx.root }
+	if ctx.opts.caster then
+		table.insert(ex, ctx.opts.caster)
+	end
+	local folder = Workspace:FindFirstChild("wakuVFX")
+	if folder then
+		table.insert(ex, folder) -- other running effects never block the ball
+	end
+	params.FilterDescendantsInstances = ex
+	local E, N, struck = M + dir * RANGE, -dir, false
+	local rc = Workspace:Raycast(M, dir * RANGE, params)
+	if rc then
+		E, N, struck = rc.Position, rc.Normal, true
+	end
+	local dist = (E - M).Magnitude
+	local flightT = 0.4 + 0.25 * dist / RANGE
+	local tHit = CHARGE + flightT
+	lastHit = tHit
+	local gm = Workspace:Raycast(M, Vector3.new(0, -9 * S, 0), params)
+	local ge = Workspace:Raycast(E + N * 0.5, Vector3.new(0, -14 * S, 0), params)
+	local side = dir:Cross(UP)
+	side = if side.Magnitude > 1e-3 then side.Unit else Vector3.xAxis
+	local lift = side:Cross(dir)
+
+	local function ink(h: number): Color3
+		return if rainbow then Kit.ink(h) else Color3.fromHSV(h % 1, 0.85, 0.16)
+	end
+	local function fire(h: number, n: number?): ColorSequence -- hot end first
+		return Kit.hueSeq(h + (if rainbow then 0.1 else 0.07), if rainbow then 0.5 else -0.07, 0.9, 1, n or 5)
+	end
+	local SMOKE = ColorSequence.new(Color3.fromRGB(34, 30, 36), Color3.fromRGB(12, 11, 14))
+
+	-- charge ---------------------------------------------------------------------------------------------------
+	local gather = { Kit.plate(ctx, "Gather", "shock_ring", 1), Kit.plate(ctx, "Gather", "shock_ring", 1), Kit.plate(ctx, "Gather", "shock_ring", 1) }
+	local chargeGlow = Kit.sprite(ctx, "ChargeGlow", "glow_soft", 2)
+	local chargeStar = Kit.sprite(ctx, "ChargeStar", "spark_glint", 3)
+	local muzzleStar = Kit.sprite(ctx, "MuzzleStar", "spark_glint", 4)
+	local muzzleRings = { Kit.plate(ctx, "MuzzleRing", "shock_ring", 1), Kit.plate(ctx, "MuzzleRing", "shock_ring", 1) }
+	local muzzleKick = Kit.flat(ctx, "MuzzleKick", { tex = "shock_ring", life = 0.3, size = { { 0, 3 }, { 0.4, 20 }, { 1, 30 } },
+		transp = { { 0, 0.1 }, { 0.5, 0.4 }, { 1, 1 } }, bright = 2, z = 0.5 })
+	local inward = Kit.burst(ctx, "ChargeIn", { tex = "spark_streak", life = { 0.1, 0.16 }, size = { { 0, 0.5 }, { 0.4, 2.6 }, { 1, 0.3 } },
+		transp = { { 0, 0.5 }, { 0.5, 0.05 }, { 1, 0.4 } }, speed = { 70, 95 }, rot = { 90 }, vpar = true, bright = 2.5 })
+
+	-- the ball -------------------------------------------------------------------------------------------------
+	local core = Kit.part(ctx, ctx.root, "Core", Vector3.one, Color3.new(1, 1, 1), Enum.Material.Neon)
+	core.Shape = Enum.PartType.Ball
+	local shellP = Kit.part(ctx, ctx.root, "Shell", Vector3.one, Color3.new(1, 1, 1), Enum.Material.Neon)
+	shellP.Shape = Enum.PartType.Ball
+	local halo = Kit.sprite(ctx, "Halo", "glow_soft", -2)
+	halo.beam.LightEmission = 0
+	local glow = Kit.sprite(ctx, "Glow", "glow_soft", 2)
+	local star = Kit.sprite(ctx, "Star", "spark_glint", 4)
+	local star2 = Kit.sprite(ctx, "Star2", "spark_glint", 4)
+	local tA0, tA1 = Kit.att(ctx), Kit.att(ctx)
+	local tailInk = Kit.beam(ctx, tA0, tA1, "slash_body", -1)
+	tailInk.Name = "TailInk"
+	tailInk.LightEmission = 0
+	local tail = Kit.beam(ctx, tA0, tA1, "slash_body", 1)
+	tail.Name = "Tail"
+	tail.Brightness = 2
+	local tailHot = Kit.beam(ctx, tA0, tA1, "bolt_glow", 2)
+	tailHot.Name = "TailHeart"
+	tailHot.Brightness = 3
+	for _, b in { tailInk, tail, tailHot } do
+		b.Width1 = 0
+		b.Enabled = false
+	end
+	local ribbons = {}
+	for i = 1, 2 do
+		local a0, a1 = Kit.att(ctx), Kit.att(ctx)
+		local b = Kit.beam(ctx, a0, a1, "slash_body", 1.5)
+		b.Name = "Ribbon"
+		b.Brightness = 2
+		b.Width1 = 0
+		b.Enabled = false
+		local c = Kit.beam(ctx, a0, a1, "bolt_glow", 2.5)
+		c.Name = "RibbonCore"
+		c.Width1 = 0
+		c.Enabled = false
+		ribbons[i] = { a0 = a0, a1 = a1, body = b, core = c }
+	end
+	local sonic = {}
+	for i = 1, 5 do
+		sonic[i] = Kit.plate(ctx, "Sonic", "shock_ring", 1)
+	end
+	local flames = Kit.burst(ctx, "Flames", { tex = "smoke_puff", life = { 0.22, 0.4 }, size = { { 0, 5 }, { 0.3, 6.5 }, { 1, 1.2 } },
+		transp = { { 0, 0.1 }, { 0.5, 0.4 }, { 1, 1 } }, speed = { 4, 14 }, spread = 40, drag = 2, acc = Vector3.new(0, 14 * S, 0),
+		rot = { 0, 360 }, rotSpeed = { -200, 200 }, bright = 2.2 })
+	local smoke = Kit.burst(ctx, "Smoke", { tex = "smoke_puff", life = { 0.6, 1 }, size = { { 0, 3.5 }, { 1, 10 } },
+		transp = { { 0, 0.35 }, { 0.5, 0.6 }, { 1, 1 } }, speed = { 2, 9 }, spread = 60, drag = 1.5, acc = Vector3.new(0, 9 * S, 0),
+		rot = { 0, 360 }, rotSpeed = { -60, 60 }, le = 0, zoff = -1 })
+	local embers = Kit.burst(ctx, "Embers", { tex = "spark_glint", life = { 0.35, 0.7 }, size = { { 0, 0 }, { 0.15, 1.3 }, { 1, 0 } },
+		speed = { 8, 30 }, spread = 70, drag = 1.5, acc = Vector3.new(0, -26 * S, 0), rot = { 0, 360 }, rotSpeed = { -200, 200 }, bright = 3 })
+
+	-- impact ---------------------------------------------------------------------------------------------------
+	local flash = Kit.sprite(ctx, "Flash", "glow_soft", 6)
+	local boomStar = Kit.sprite(ctx, "BoomStar", "spark_glint", 7)
+	local boomStar2 = Kit.sprite(ctx, "BoomStar2", "spark_glint", 7)
+	local boomInk = Kit.sprite(ctx, "BoomInk", "glow_soft", -2)
+	boomInk.beam.LightEmission = 0
+	local boomRing = Kit.sprite(ctx, "BoomRing", "shock_ring", 3)
+	local dome = Kit.part(ctx, ctx.root, "Dome", Vector3.one, Color3.new(1, 1, 1), Enum.Material.Neon)
+	dome.Shape = Enum.PartType.Ball
+	local domeHot = Kit.part(ctx, ctx.root, "DomeHeart", Vector3.one, Color3.new(1, 1, 1), Enum.Material.Neon)
+	domeHot.Shape = Enum.PartType.Ball
+	local spikes = {}
+	local nb = N:Cross(UP)
+	nb = if nb.Magnitude > 1e-3 then nb.Unit else Vector3.xAxis
+	local nc = N:Cross(nb)
+	for i = 1, 16 do
+		local a = (i - 1) / 16 * math.pi * 2 + rng:NextNumber(-0.15, 0.15)
+		local tilt = if i % 2 == 0 then rng:NextNumber(0.1, 0.35) else rng:NextNumber(0.5, 1.1)
+		local d = ((nb * math.cos(a) + nc * math.sin(a)) * math.cos(tilt) + N * math.sin(tilt)).Unit
+		local a0, a1 = Kit.att(ctx), Kit.att(ctx)
+		local inkB = Kit.beam(ctx, a0, a1, "bolt_glow", 0)
+		inkB.Name = "SpikeInk"
+		inkB.LightEmission = 0
+		local b = Kit.beam(ctx, a0, a1, "bolt_glow", 2)
+		b.Name = "Spike"
+		b.Brightness = 2
+		local c = Kit.beam(ctx, a0, a1, "bolt_glow", 3)
+		c.Name = "SpikeCore"
+		for _, x in { inkB, b, c } do
+			x.Segments = 1
+			x.Width1 = 0
+			x.Enabled = false
+		end
+		spikes[i] = { d = d, len = rng:NextNumber(26, 44) * S, a0 = a0, a1 = a1, ink = inkB, body = b, core = c, tint = i / 16 }
+	end
+	local shocks = { Kit.plate(ctx, "Shock", "shock_ring", 2), Kit.plate(ctx, "Shock", "shock_ring", 2), Kit.plate(ctx, "Shock", "shock_ring", 2) }
+	local shockInk = Kit.plate(ctx, "ShockInk", "shock_ring", 1)
+	shockInk.beam.LightEmission = 0
+	local scorch = Kit.plate(ctx, "Scorch", "ground_disc", 0.3)
+	scorch.beam.LightEmission = 0
+	local scorchCrack = Kit.plate(ctx, "ScorchCrack", "ground_crack", 0.5)
+	scorchCrack.beam.LightEmission = 0
+	local scorchRing = Kit.plate(ctx, "ScorchRing", "shock_ring", 0.6)
+	scorchRing.beam.LightEmission = 0
+	local emberCrack = Kit.plate(ctx, "EmberCrack", "ground_crack", 0.8)
+	emberCrack.beam.Brightness = 2.5
+	local emberRing = Kit.plate(ctx, "EmberRing", "shock_ring", 0.9)
+	local groundShock = Kit.flat(ctx, "GroundShock", { tex = "shock_ring", life = 0.45, size = { { 0, 8 }, { 0.3, 46 }, { 1, 74 } },
+		transp = { { 0, 0 }, { 0.5, 0.3 }, { 1, 1 } }, bright = 2.5, z = 1 })
+	local groundInk = Kit.flat(ctx, "GroundInk", { tex = "shock_ring", life = 0.5, size = { { 0, 10 }, { 0.3, 54 }, { 1, 86 } },
+		transp = { { 0, 0.15 }, { 0.6, 0.5 }, { 1, 1 } }, le = 0, z = 0.5 })
+	local bolts = {}
+	for i = 1, 5 do
+		bolts[i] = { glow = Kit.bolt(ctx, "HakiGlow", 5, 3, 1), core = Kit.bolt(ctx, "HakiCore", 5, 4, 0) }
+	end
+	local sparks = Kit.burst(ctx, "Sparks", { tex = "spark_streak", life = { 0.35, 0.8 }, size = { { 0, 0.5 }, { 0.2, 2.6 }, { 1, 0.2 } },
+		transp = { { 0, 0 }, { 0.6, 0.15 }, { 1, 1 } }, speed = { 60, 150 }, spread = 62, drag = 2.2, acc = Vector3.new(0, -90 * S, 0),
+		rot = { 90 }, vpar = true, bright = 3 })
+	local glints = Kit.burst(ctx, "Glints", { tex = "spark_glint", life = { 0.3, 0.7 }, size = { { 0, 0 }, { 0.2, 2.2 }, { 1, 0 } },
+		speed = { 20, 70 }, drag = 3, rot = { 0, 360 }, rotSpeed = { -200, 200 }, bright = 3 })
+	local lines = Kit.burst(ctx, "BoomLines", { tex = "spark_streak", life = { 0.12, 0.22 }, size = { { 0, 0.8 }, { 0.3, 6.5 }, { 1, 0.5 } },
+		transp = { { 0, 0.1 }, { 0.6, 0.3 }, { 1, 1 } }, speed = { 150, 240 }, spread = 75, rot = { 90 }, vpar = true, bright = 2.5 })
+	local roll = Kit.burst(ctx, "FireRoll", { tex = "smoke_puff", life = { 0.3, 0.55 }, size = { { 0, 5 }, { 0.3, 11 }, { 1, 3 } },
+		transp = { { 0, 0.05 }, { 0.5, 0.35 }, { 1, 1 } }, speed = { 30, 90 }, spread = 80, drag = 4.5, acc = Vector3.new(0, 20 * S, 0),
+		rot = { 0, 360 }, rotSpeed = { -240, 240 }, bright = 2.5 })
+	local boomSmoke = Kit.burst(ctx, "BoomSmoke", { tex = "smoke_puff", life = { 0.7, 1.1 }, size = { { 0, 6 }, { 1, 17 } },
+		transp = { { 0, 0.3 }, { 0.5, 0.55 }, { 1, 1 } }, speed = { 14, 50 }, spread = 80, drag = 3.5, acc = Vector3.new(0, 16 * S, 0),
+		rot = { 0, 360 }, rotSpeed = { -50, 50 }, le = 0, zoff = -1 })
+	local licks = Kit.burst(ctx, "Licks", { tex = "smoke_puff", life = { 0.25, 0.45 }, size = { { 0, 2.6 }, { 0.3, 3.4 }, { 1, 0.4 } },
+		transp = { { 0, 0.15 }, { 0.6, 0.4 }, { 1, 1 } }, speed = { 8, 18 }, spread = 12, acc = Vector3.new(0, 30 * S, 0),
+		rot = { 0, 360 }, rotSpeed = { -160, 160 }, bright = 2.2 })
+
+	local grade = Kit.grade(ctx)
+	local lightPart = Kit.part(ctx, ctx.root, "Light", Vector3.one * 0.2, Color3.new(), Enum.Material.SmoothPlastic)
+	lightPart.Transparency = 1
+	local light = Kit.light(ctx, lightPart, 42 * S)
+
+	local once = Kit.once()
+	local nTrail, nLick, nIn = 0, 0, 0
+	local RB = 4.4 * S -- ball radius
+
+	local function headAt(t: number): Vector3
+		local u = math.clamp((t - CHARGE) / flightT, 0, 1)
+		return M + dir * dist * u
+	end
+
+	return function(t: number)
+		local h = Kit.hue(ctx, t, 0)
+		local flying = t >= CHARGE and t < tHit
+		local tb = t - tHit
+		local flick = 0.75 + 0.25 * Kit.slotRng(seed, t, 1 / 30):NextNumber()
+
+		-- charge -------------------------------------------------------------------------------------------------
+		if t < CHARGE then
+			local u = t / CHARGE
+			for i, pl in gather do
+				local gu = Kit.ramp(t, (i - 1) * 0.04, CHARGE - 0.02 + (i - 1) * 0.01)
+				pl.beam.Color = fire(Kit.hue(ctx, t, i * 0.25), 4)
+				pl.set(M + dir * (i - 1) * 0.6 * S, dir, (26 - 23 * Kit.easeIn(gu)) * S, if gu <= 0 or gu >= 1 then 1 else 0.9 - 0.8 * gu, t * 9 + i)
+			end
+			chargeGlow.beam.Color = ColorSequence.new(Kit.hot(h))
+			chargeGlow.set(M, (4 + 16 * Kit.easeIn(u)) * S * flick, 0.25)
+			chargeStar.beam.Color = ColorSequence.new(Color3.new(1, 1, 1))
+			chargeStar.set(M, (6 + 30 * Kit.easeIn(u)) * S, 0.05, t * 14, 1)
+			local want = math.floor(t / 0.012)
+			while nIn < want do
+				nIn += 1
+				local dv = Vector3.new(rng:NextNumber(-1, 1), rng:NextNumber(-1, 1), rng:NextNumber(-1, 1))
+				local d = if dv.Magnitude > 0.01 then dv.Unit else UP
+				inward.Color = ColorSequence.new(Kit.col(Kit.hue(ctx, t, rng:NextNumber()), 0.8, 1), Kit.hot(h))
+				ctx.host.CFrame = Kit.upTo(M + d * 11 * S, -d)
+				inward:Emit(1)
+			end
+		else
+			for _, pl in gather do
+				pl.hide()
+			end
+			chargeGlow.hide()
+			chargeStar.hide()
+		end
+
+		-- launch -------------------------------------------------------------------------------------------------
+		if once("launch", t, CHARGE) then
+			if gm then
+				muzzleKick.fire(CHARGE, gm.Position + UP * 0.08, fire(h, 4))
+				Kit.spray(ctx, smoke, gm.Position + UP * S, 12, SMOKE, "disc", 2, 0.15)
+			end
+			Kit.spray(ctx, glints, M, 16, ColorSequence.new(Kit.hot(h), Kit.col(h + 0.1 * span)), "sphere", 1)
+			Kit.spray(ctx, embers, M, 20, fire(h, 3), "point", 0, 0, -dir)
+		end
+		muzzleKick.update(t)
+		local mf = if t >= CHARGE then 1 - Kit.ramp(t, CHARGE, CHARGE + 0.14) else 0
+		muzzleStar.beam.Color = ColorSequence.new(Kit.hot(h))
+		muzzleStar.set(M, 56 * S * mf, if mf > 0 then 0 else 1, 0.5, 1)
+		for i, pl in muzzleRings do
+			pl.beam.Color = fire(h + i * 0.2 * span, 4)
+			Kit.pulse(pl, M - dir * (i - 1) * 2 * S, dir, Kit.ramp(t, CHARGE + (i - 1) * 0.04, CHARGE + 0.28 + (i - 1) * 0.06), 6 * S, (30 + 12 * i) * S, 0.05, i)
+		end
+
+		-- the ball -----------------------------------------------------------------------------------------------
+		local H = headAt(t)
+		if flying then
+			local tf = t - CHARGE
+			local pop = 1 + 0.5 * math.exp(-tf * 16) -- leaves the hand swollen
+			local wob = 1 + 0.08 * math.sin(t * 61)
+			core.Size = Vector3.one * RB * 1.25 * pop * wob
+			core.CFrame = CFrame.new(H)
+			core.Color = Kit.hot(h)
+			core.Transparency = 0
+			shellP.Size = Vector3.one * RB * 2 * pop * (2 - wob)
+			shellP.CFrame = CFrame.new(H)
+			shellP.Color = Kit.col(h, 0.9, 1)
+			shellP.Transparency = 0.45 + 0.15 * (1 - flick)
+			halo.beam.Color = ColorSequence.new(ink(h))
+			halo.set(H - dir * 1.5 * S, RB * 5.6 * pop, 0.3)
+			glow.beam.Color = ColorSequence.new(Kit.col(h + 0.06 * span, 0.55, 1))
+			glow.set(H, RB * 4.6 * pop * flick, 0.15)
+			star.beam.Color = ColorSequence.new(Color3.new(1, 1, 1))
+			star.set(H, RB * 7.5 * (0.8 + 0.2 * flick), 0.05, t * 9, 1)
+			star2.beam.Color = ColorSequence.new(Kit.hot(h + 0.3 * span))
+			star2.set(H, RB * 5, 0.2, -t * 13 + 0.8, 1)
+
+			local L = math.min((H - M).Magnitude, 34 * S)
+			if L > 0.5 then
+				local sway = side * math.cos(t * 23) + lift * math.sin(t * 23)
+				tA0.CFrame = Kit.rightTo(H, sway)
+				tA1.CFrame = Kit.rightTo(H - dir * L, sway)
+				local bend = 2.2 * S * math.sin(t * 37)
+				for _, b in { tailInk, tail, tailHot } do
+					b.CurveSize0, b.CurveSize1 = bend, -bend * 1.6
+					b.Enabled = true
+				end
+				tailInk.Width0 = RB * 3.5
+				tailInk.Color = ColorSequence.new(ink(h))
+				tailInk.Transparency = Kit.numSeq({ { 0, 0.15 }, { 0.6, 0.45 }, { 1, 1 } })
+				tail.Width0 = RB * 2.5 * (2 - wob)
+				tail.Color = fire(h, 6)
+				tail.Transparency = Kit.numSeq({ { 0, 0 }, { 0.6, 0.25 }, { 1, 1 } })
+				tailHot.Width0 = RB * 1.15
+				tailHot.Color = ColorSequence.new(Kit.hot(h))
+				tailHot.Transparency = Kit.numSeq({ { 0, 0 }, { 0.5, 0.2 }, { 1, 1 } })
+				for i, r in ribbons do
+					local a = t * 26 + i * math.pi
+					local rv = side * math.cos(a) + lift * math.sin(a)
+					local Lr = L * 0.75
+					r.a0.CFrame = Kit.rightTo(H + rv * RB * 0.7, rv)
+					r.a1.CFrame = Kit.rightTo(H - dir * Lr - rv * RB * 0.5, rv)
+					local k = RB * 2.4
+					r.body.CurveSize0, r.body.CurveSize1, r.core.CurveSize0, r.core.CurveSize1 = k, k, k, k
+					r.body.Width0 = RB * 1.1
+					r.body.Color = fire(Kit.hue(ctx, t, 0.3 + i * 0.25), 5)
+					r.body.Transparency = Kit.numSeq({ { 0, 0.05 }, { 0.7, 0.3 }, { 1, 1 } })
+					r.core.Width0 = RB * 0.35
+					r.core.Color = ColorSequence.new(Color3.new(1, 1, 1))
+					r.core.Transparency = Kit.numSeq({ { 0, 0 }, { 0.7, 0.3 }, { 1, 1 } })
+					r.body.Enabled, r.core.Enabled = true, true
+				end
+			end
+			-- what it leaves behind
+			local want = math.floor(tf / 0.011)
+			while nTrail < want do
+				nTrail += 1
+				local P = headAt(CHARGE + nTrail * 0.011) - dir * RB * 0.6
+				flames.Color = fire(Kit.hue(ctx, t, rng:NextNumber() * 0.4), 4)
+				ctx.host.CFrame = Kit.upTo(P + (side * rng:NextNumber(-1, 1) + lift * rng:NextNumber(-1, 1)) * RB * 0.5, -dir)
+				flames:Emit(1)
+				if nTrail % 2 == 0 then
+					smoke.Color = SMOKE
+					ctx.host.CFrame = Kit.upTo(P - dir * RB, -dir + lift * 0.4)
+					smoke:Emit(1)
+				end
+				embers.Color = ColorSequence.new(Kit.hot(h), Kit.col(Kit.hue(ctx, t, rng:NextNumber() * 0.5), 0.9, 1))
+				ctx.host.CFrame = Kit.upTo(P, -dir)
+				embers:Emit(1)
+			end
+		else
+			core.CFrame, shellP.CFrame = Kit.HIDE, Kit.HIDE
+			halo.hide()
+			glow.hide()
+			star.hide()
+			star2.hide()
+			tailInk.Enabled, tail.Enabled, tailHot.Enabled = false, false, false
+			for _, r in ribbons do
+				r.body.Enabled, r.core.Enabled = false, false
+			end
+		end
+		-- sonic rings shed along the path
+		for i, pl in sonic do
+			local at = CHARGE + flightT * (i - 0.5) / #sonic
+			pl.beam.Color = fire(Kit.hue(ctx, at, i * 0.2), 4)
+			Kit.pulse(pl, headAt(at), dir, Kit.ramp(t, at, at + 0.26), 5 * S, 30 * S, 0.1, i * 1.3)
+		end
+
+		-- impact -------------------------------------------------------------------------------------------------
+		local G = if ge then ge.Position + UP * 0.08 else nil
+		if once("boom", t, tHit) then
+			local out = E + N * 1.5 * S
+			Kit.spray(ctx, sparks, out, 90, ColorSequence.new(Kit.hot(h), Kit.col(h + 0.08 * span, 0.9, 1)), "point", 0, 0, N)
+			Kit.spray(ctx, lines, out, 46, ColorSequence.new(Kit.hot(h), Kit.col(h + 0.3 * span, 0.7, 1)), "point", 0, 0, N)
+			Kit.spray(ctx, glints, out, 40, ColorSequence.new(Kit.hot(h), Kit.col(h + 0.15 * span)), "sphere", 4)
+			Kit.spray(ctx, roll, out, 34, fire(h, 5), "point", 0, 0, N)
+			Kit.spray(ctx, boomSmoke, out, 22, SMOKE, "point", 0, 0, N)
+			Kit.spray(ctx, embers, out, 40, fire(h, 3), "sphere", 3)
+			if G then
+				groundShock.fire(tHit, G, fire(h, 6))
+				groundInk.fire(tHit, G, ColorSequence.new(ink(h)))
+				Kit.spray(ctx, boomSmoke, G + UP * S, 14, SMOKE, "disc", 5, 0.2)
+			end
+		end
+		groundShock.update(t)
+		groundInk.update(t)
+		if tb >= 0 then
+			local u = tb / BURST
+			local bf = 1 - Kit.ramp(tb, 0, 0.16)
+			flash.beam.Color = ColorSequence.new(Kit.hot(h))
+			flash.set(E + N * S, (40 + 80 * bf) * S, 1 - bf)
+			boomStar.beam.Color = ColorSequence.new(Color3.new(1, 1, 1))
+			boomStar.set(E + N * S, 150 * S * bf, if bf > 0 then 0 else 1, 0.4, 1)
+			boomStar2.beam.Color = ColorSequence.new(Kit.hot(h + 0.3 * span))
+			boomStar2.set(E + N * S, 100 * S * bf, if bf > 0 then 0.05 else 1, 0.4 + math.pi / 4 + tb * 5, 1)
+			local iu = Kit.ramp(tb, 0, 0.5)
+			boomInk.beam.Color = ColorSequence.new(ink(h))
+			boomInk.set(E + N * S, (30 + 60 * Kit.easeOut(iu)) * S, if iu >= 1 then 1 else 0.25 + 0.75 * iu * iu)
+			local ru = Kit.ramp(tb, 0.02, 0.38)
+			boomRing.beam.Color = fire(h, 6)
+			boomRing.set(E + N * S, (14 + 90 * Kit.easeOut(ru)) * S, if ru <= 0 or ru >= 1 then 1 else 0.05 + 0.95 * ru * ru)
+			if u < 1 then
+				local g = Kit.easeOut(u)
+				dome.Size = Vector3.one * (10 + 38 * g) * S
+				dome.CFrame = CFrame.new(E)
+				dome.Color = Kit.col(h + 0.05 * span * u, 0.9, 1)
+				dome.Transparency = math.clamp(0.25 + 0.75 * u ^ 1.5, 0, 1)
+				local g2 = Kit.easeOut(Kit.ramp(tb, 0, BURST * 0.7))
+				domeHot.Size = Vector3.one * (8 + 22 * g2) * S
+				domeHot.CFrame = CFrame.new(E)
+				domeHot.Color = Kit.hot(h)
+				domeHot.Transparency = math.clamp(g2 ^ 2, 0, 1)
+			else
+				dome.CFrame, domeHot.CFrame = Kit.HIDE, Kit.HIDE
+			end
+			for _, sp in spikes do
+				local su = Kit.ramp(tb, 0, 0.3)
+				if su >= 1 then
+					sp.ink.Enabled, sp.body.Enabled, sp.core.Enabled = false, false, false
+					continue
+				end
+				local headD = sp.len * Kit.easeOut(su)
+				local tailD = sp.len * Kit.easeOut(Kit.ramp(tb, 0.08, 0.3)) * 0.9
+				sp.a0.CFrame = CFrame.new(E + sp.d * headD)
+				sp.a1.CFrame = CFrame.new(E + sp.d * tailD)
+				local hs = Kit.hue(ctx, t, sp.tint * (if rainbow then 1 else 0.5))
+				sp.ink.Width0 = 6.5 * S
+				sp.ink.Color = ColorSequence.new(ink(hs))
+				sp.ink.Transparency = Kit.numSeq({ { 0, 0.2 }, { 1, 1 } })
+				sp.body.Width0 = 4 * S
+				sp.body.Color = ColorSequence.new(Kit.col(hs, 0.9, 1))
+				sp.body.Transparency = Kit.numSeq({ { 0, 0 }, { 1, 1 } })
+				sp.core.Width0 = 1.5 * S
+				sp.core.Color = ColorSequence.new(Color3.new(1, 1, 1))
+				sp.core.Transparency = Kit.numSeq({ { 0, 0 }, { 1, 1 } })
+				sp.ink.Enabled, sp.body.Enabled, sp.core.Enabled = true, true, true
+			end
+			for i, pl in shocks do
+				pl.beam.Color = fire(Kit.hue(ctx, t, i * 0.2), 5)
+				Kit.pulse(pl, E + N * (0.3 + (i - 1) * 2.5) * S, N, Kit.ramp(tb, (i - 1) * 0.05, 0.34 + (i - 1) * 0.08), 8 * S, (56 + 16 * i) * S, 0.02, i * 2)
+			end
+			shockInk.beam.Color = ColorSequence.new(ink(h))
+			Kit.pulse(shockInk, E + N * 0.2 * S, N, Kit.ramp(tb, 0, 0.5), 10 * S, 84 * S, 0.2, 1)
+
+			-- black lightning spitting off the burst
+			local slot = math.floor(t / 0.05)
+			local crawl = 1 - Kit.ramp(tb, 0.04, 0.4)
+			for i, b in bolts do
+				local r = Random.new(seed * 131 + i * 977 + slot * 31)
+				if crawl > 0 and r:NextNumber() < 0.3 + 0.65 * crawl then
+					local a = r:NextNumber(0, math.pi * 2)
+					local el = r:NextNumber(0.05, 1.2)
+					local d = ((nb * math.cos(a) + nc * math.sin(a)) * math.cos(el) + N * math.sin(el)).Unit
+					local p0 = E + d * 4 * S
+					local p1 = E + d * r:NextNumber(18, 34) * S
+					local sd = seed * 53 + i * 101 + slot
+					b.glow.set(p0, p1, 3 * S, 0.14, sd, Kit.col(Kit.hue(ctx, t, i / #bolts * span), 0.9, 1), 0.3)
+					b.core.set(p0, p1, 1.1 * S, 0.14, sd, Color3.new(0, 0, 0), 0)
+				else
+					b.glow.hide()
+					b.core.hide()
+				end
+			end
+
+			-- what is left on the surface
+			if struck then
+				local fadeOut = Kit.ramp(t, life - 0.3, life)
+				local stamp = Kit.easeOut(Kit.ramp(tb, 0, 0.12))
+				local base = E + N * 0.12
+				scorch.beam.Color = ColorSequence.new(Color3.fromRGB(10, 8, 9))
+				scorch.set(base, N, 44 * S * stamp, 0.25 + 0.75 * fadeOut, 0.6)
+				scorchCrack.beam.Color = ColorSequence.new(Color3.fromRGB(6, 5, 6))
+				scorchCrack.set(base + N * 0.02, N, 40 * S * stamp, 0.05 + 0.95 * fadeOut, 1.9)
+				scorchRing.beam.Color = ColorSequence.new(Color3.fromRGB(8, 6, 7))
+				scorchRing.set(base + N * 0.04, N, 34 * S * stamp, 0.2 + 0.8 * fadeOut, 0.2)
+				local cool = Kit.ramp(tb, 0.05, life - tHit - 0.1)
+				emberCrack.beam.Color = fire(h, 5)
+				emberCrack.set(base + N * 0.06, N, 40 * S * stamp, math.clamp(0.05 + cool * 0.95 + 0.12 * (1 - flick), 0, 1), 1.9)
+				emberRing.beam.Color = fire(h + 0.15 * span, 5)
+				emberRing.set(base + N * 0.08, N, 34 * S * stamp, math.clamp(0.15 + cool * 0.85, 0, 1), 0.2)
+				if cool < 0.75 then
+					local want = math.floor(tb / 0.03)
+					while nLick < want do
+						nLick += 1
+						local a = rng:NextNumber(0, math.pi * 2)
+						local rr = rng:NextNumber(3, 15) * S
+						licks.Color = fire(Kit.hue(ctx, t, rng:NextNumber() * 0.5), 4)
+						ctx.host.CFrame = Kit.upTo(E + (nb * math.cos(a) + nc * math.sin(a)) * rr + N * 0.5 * S, (N + UP).Unit)
+						licks:Emit(1)
+					end
+				end
+			end
+		else
+			flash.hide()
+			boomStar.hide()
+			boomStar2.hide()
+			boomInk.hide()
+			boomRing.hide()
+			dome.CFrame, domeHot.CFrame = Kit.HIDE, Kit.HIDE
+			for _, sp in spikes do
+				sp.ink.Enabled, sp.body.Enabled, sp.core.Enabled = false, false, false
+			end
+			for _, pl in shocks do
+				pl.hide()
+			end
+			shockInk.hide()
+			for _, b in bolts do
+				b.glow.hide()
+				b.core.hide()
+			end
+			scorch.hide()
+			scorchCrack.hide()
+			scorchRing.hide()
+			emberCrack.hide()
+			emberRing.hide()
+		end
+
+		if grade then
+			local k = if tb >= 0 then math.exp(-tb * 12) else 0
+			grade.Brightness = 0.3 * k
+			grade.Contrast = 0.3 * k
+			grade.Saturation = 0.25 * k
+			grade.TintColor = Color3.new(1, 1, 1):Lerp(Kit.col(h, 0.25, 1), k)
+		end
+		lightPart.CFrame = CFrame.new(if tb >= 0 then E + N * 3 * S else (if t < CHARGE then M else H))
+		light.Color = Kit.col(h, 0.5, 1)
+		light.Brightness = if tb >= 0 then 14 * math.exp(-tb * 5) + 1.5 * (1 - Kit.ramp(t, life - 0.4, life))
+			elseif flying then 6 * flick
+			else 5 * (t / CHARGE)
+	end
+end
+
+-- a tick as it leaves the hand, a wallop when it lands
+function Fireball.shake(t: number): Vector3
+	local k = 0
+	if t >= lastHit then
+		k = 1.0 * math.exp(-(t - lastHit) * 8)
+	elseif t >= CHARGE then
+		k = 0.18 * math.exp(-(t - CHARGE) * 14) + 0.04
+	end
+	return Vector3.new(math.sin(t * 113) * k, math.cos(t * 137) * k, 0)
+end
+
+return Fireball
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="13">
           <Properties>
             <string name="Name">GhostDash</string>
             <string name="Source"><![CDATA[--!strict
@@ -2545,7 +3546,7 @@ return GhostDash
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="12">
+        <Item class="ModuleScript" referent="14">
           <Properties>
             <string name="Name">HitBurst</string>
             <string name="Source"><![CDATA[--!strict
@@ -2673,7 +3674,7 @@ return HitBurst
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="13">
+        <Item class="ModuleScript" referent="15">
           <Properties>
             <string name="Name">ImpactFlash</string>
             <string name="Source"><![CDATA[--!strict
@@ -2943,7 +3944,7 @@ return ImpactFlash
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="14">
+        <Item class="ModuleScript" referent="16">
           <Properties>
             <string name="Name">PrismCleave</string>
             <string name="Source"><![CDATA[--!strict
@@ -3345,7 +4346,960 @@ return PrismCleave
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="15">
+        <Item class="ModuleScript" referent="17">
+          <Properties>
+            <string name="Name">QuakeSlam</string>
+            <string name="Source"><![CDATA[--!strict
+--[[ QuakeSlam: something enormous hits the floor.
+	cf = the slam point (or the caster's root: the effect drops to the ground below it). No pose, no caster needed.
+
+	0.00-0.20  wind-up: a comet of pressure falls out of the sky onto the point, rings close in along the ground
+	0.20       SLAM: white-out flash, a light pillar punches up through three sky rings, a pressure dome blows out,
+	           shock rings and a wall of dust race along the ground
+	0.20-0.52  a star of cracks tears outward (dark fissure, white-hot seam, a curtain of light standing in each one),
+	           black lightning whips round the crater, dark stone is thrown into the air
+	0.52-1.20  the rock tumbles back down (every chunk has landed by 1.2 s), the seams cool
+	1.20-1.90  embers drift up out of the cracks, the fissures and the rubble fade
+	Not EarthRise: nothing stays standing. ]]
+local Workspace = game:GetService("Workspace")
+local Kit = require(script.Parent.Parent.Kit)
+
+local SLAM = 0.2
+local RACE = 0.32 -- the cracks reach full length this long after the slam
+local UP = Vector3.yAxis
+
+local QuakeSlam = {
+	life = 1.9,
+	required = { "glow_soft", "spark_streak", "spark_glint", "shock_ring", "ground_crack", "ground_disc", "bolt_glow", "smoke_puff" },
+}
+
+type Seg = { p0: Vector3, p1: Vector3, d0: number, d1: number, a0: Attachment, a1: Attachment, ink: Beam, hot: Beam,
+	w0: Attachment?, w1: Attachment?, wall: Beam?, wide0: number, wide1: number, tint: number }
+type Crack = { pts: { Vector3 }, dist: { number }, tint: number }
+type Chunk = { part: Part, base: Vector3, dir: Vector3, r0: number, run: number, T: number, H: number, delay: number,
+	spin: Vector3, tint: number }
+
+function QuakeSlam.build(ctx: Kit.Ctx): (number) -> ()
+	local S = ctx.opts.scale
+	local rng = ctx.rng
+	local seed = ctx.opts.seed
+	local life = QuakeSlam.life
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local ex: { Instance } = { ctx.root }
+	if ctx.opts.caster then
+		table.insert(ex, ctx.opts.caster)
+	end
+	local folder = Workspace:FindFirstChild("wakuVFX")
+	if folder then
+		table.insert(ex, folder)
+	end
+	params.FilterDescendantsInstances = ex
+	local hit = Workspace:Raycast(ctx.cf.Position + UP * 4 * S, -UP * 30 * S, params)
+	local G = (if hit then hit.Position else ctx.cf.Position) + UP * 0.08
+
+	-- wind-up: the falling comet ------------------------------------------------------------------------------
+	local cometGlow = Kit.sprite(ctx, "CometGlow", "glow_soft", 3)
+	local cometStar = Kit.sprite(ctx, "CometStar", "spark_glint", 4)
+	local cA0, cA1 = Kit.att(ctx), Kit.att(ctx)
+	local cometInk = Kit.beam(ctx, cA0, cA1, "bolt_glow", -1)
+	cometInk.Name = "CometInk"
+	cometInk.LightEmission = 0
+	local cometTail = Kit.beam(ctx, cA0, cA1, "bolt_glow", 1)
+	cometTail.Name = "CometTail"
+	local cometCore = Kit.beam(ctx, cA0, cA1, "bolt_glow", 2)
+	cometCore.Name = "CometCore"
+	for _, b in { cometInk, cometTail, cometCore } do
+		b.Segments = 1
+		b.Enabled = false
+	end
+	local closeRings = { Kit.plate(ctx, "CloseRing", "shock_ring", 1), Kit.plate(ctx, "CloseRing", "shock_ring", 1) }
+	local streakDown = Kit.burst(ctx, "StreakDown", { tex = "spark_streak", life = { 0.12, 0.18 }, size = { { 0, 0.6 }, { 0.3, 3.4 }, { 1, 0.4 } },
+		transp = { { 0, 1 }, { 0.25, 0 }, { 1, 0.5 } }, speed = { 120, 170 }, rot = { 90 }, vpar = true, bright = 2 })
+
+	-- the slam -------------------------------------------------------------------------------------------------
+	local flash = Kit.sprite(ctx, "Flash", "glow_soft", 6)
+	local star = Kit.sprite(ctx, "FlashStar", "spark_glint", 7)
+	local star2 = Kit.sprite(ctx, "FlashStar2", "spark_glint", 7)
+	local pA0, pA1 = Kit.att(ctx), Kit.att(ctx)
+	local pillarInk = Kit.beam(ctx, pA0, pA1, "bolt_glow", -1)
+	pillarInk.Name = "PillarInk"
+	pillarInk.LightEmission = 0
+	local pillar = Kit.beam(ctx, pA0, pA1, "bolt_glow", 1)
+	pillar.Name = "Pillar"
+	local pillarCore = Kit.beam(ctx, pA0, pA1, "bolt_glow", 2)
+	pillarCore.Name = "PillarCore"
+	pillarCore.Brightness = 3
+	for _, b in { pillarInk, pillar, pillarCore } do
+		b.Segments = 1
+		b.Enabled = false
+	end
+	local skyRings = { Kit.plate(ctx, "SkyRing", "shock_ring", 2), Kit.plate(ctx, "SkyRing", "shock_ring", 2), Kit.plate(ctx, "SkyRing", "shock_ring", 2) }
+	local dome = Kit.part(ctx, ctx.root, "PressureDome", Vector3.one, Color3.new(1, 1, 1), Enum.Material.ForceField)
+	dome.Shape = Enum.PartType.Ball
+	local shock1 = Kit.flat(ctx, "Shock", { tex = "shock_ring", life = 0.5, size = { { 0, 6 }, { 0.2, 44 }, { 1, 84 } },
+		transp = { { 0, 0 }, { 0.5, 0.3 }, { 1, 1 } }, bright = 2.5, z = 2 })
+	local shock2 = Kit.flat(ctx, "Shock2", { tex = "shock_ring", life = 0.62, size = { { 0, 4 }, { 0.25, 30 }, { 1, 58 } },
+		transp = { { 0, 0.1 }, { 0.5, 0.35 }, { 1, 1 } }, bright = 2, z = 2 })
+	local shock3 = Kit.flat(ctx, "Shock3", { tex = "shock_ring", life = 0.7, size = { { 0, 3 }, { 0.3, 20 }, { 1, 40 } },
+		transp = { { 0, 0.2 }, { 0.5, 0.4 }, { 1, 1 } }, bright = 1.6, spin = 60, z = 2 })
+	local shockInk = Kit.flat(ctx, "ShockInk", { tex = "shock_ring", life = 0.66, size = { { 0, 8 }, { 0.2, 50 }, { 1, 92 } },
+		transp = { { 0, 0.1 }, { 0.6, 0.45 }, { 1, 1 } }, le = 0, z = 1 })
+	local crater = Kit.flat(ctx, "CraterDark", { tex = "ground_crack", life = life - SLAM, size = { { 0, 6 }, { 0.06, 26 }, { 1, 28 } },
+		transp = { { 0, 0 }, { 0.75, 0.1 }, { 1, 1 } }, le = 0, rot = rng:NextNumber(0, 360), z = 0.4 })
+	local craterHot = Kit.flat(ctx, "CraterHot", { tex = "ground_crack", life = 1.2, size = { { 0, 6 }, { 0.08, 26 }, { 1, 28 } },
+		transp = { { 0, 0 }, { 0.4, 0.25 }, { 1, 1 } }, bright = 3, rot = rng:NextNumber(0, 360), z = 0.8 })
+	local glowDisc = Kit.plate(ctx, "GlowDisc", "ground_disc", 0.2)
+	glowDisc.beam.Brightness = 1.6
+
+	-- the star of cracks: jagged polylines along the ground, each segment a dark fissure, a hot seam and (on the
+	-- main run) a curtain of light standing in it
+	local NCRACK = 8
+	local segs: { Seg } = {}
+	local cracks: { Crack } = {}
+	local maxLen = 0
+	local function flatBeam(name: string, a0: Attachment, a1: Attachment, z: number, le: number): Beam
+		local b = Kit.beam(ctx, a0, a1, "bolt_glow", z)
+		b.Name = name
+		b.FaceCamera = false
+		b.Segments = 1
+		b.LightEmission = le
+		b.Enabled = false
+		return b
+	end
+	local function addSeg(p0: Vector3, p1: Vector3, d0: number, d1: number, wide0: number, wide1: number, tint: number, wall: boolean)
+		local a0, a1 = Kit.att(ctx), Kit.att(ctx)
+		local s: Seg = { p0 = p0, p1 = p1, d0 = d0, d1 = d1, a0 = a0, a1 = a1, wide0 = wide0, wide1 = wide1, tint = tint,
+			ink = flatBeam("Fissure", a0, a1, 0.3, 0), hot = flatBeam("Seam", a0, a1, 0.7, 1) }
+		s.hot.Brightness = 3
+		if wall then
+			local w0, w1 = Kit.att(ctx), Kit.att(ctx)
+			s.w0, s.w1 = w0, w1
+			s.wall = flatBeam("SeamLight", w0, w1, 1, 1)
+		end
+		table.insert(segs, s)
+	end
+	local function flatDir(a: number): Vector3
+		return Vector3.new(math.cos(a), 0, math.sin(a))
+	end
+	for i = 1, NCRACK do
+		local ang = (i - 1) / NCRACK * math.pi * 2 + rng:NextNumber(-0.2, 0.2)
+		local L = rng:NextNumber(21, 33) * S
+		local tint = (i - 1) / NCRACK
+		local NPT = 5
+		local pts = { G + flatDir(ang) * 1.4 * S }
+		local dist = { 1.4 * S }
+		local a = ang
+		for k = 1, NPT do
+			a += rng:NextNumber(-0.3, 0.3)
+			local step = (L - 1.4 * S) / NPT
+			local p1 = pts[k] + flatDir(a) * step
+			table.insert(pts, p1)
+			table.insert(dist, dist[k] + step)
+			addSeg(pts[k], p1, dist[k], dist[k] + step, (2.3 - 1.9 * (k - 1) / NPT) * S, (2.3 - 1.9 * k / NPT) * S, tint, true)
+			if k == 2 or k == 4 then -- a fork
+				local fa = a + (if rng:NextNumber() < 0.5 then -1 else 1) * rng:NextNumber(0.55, 0.95)
+				local fl = step * rng:NextNumber(0.7, 1.15)
+				local w = (2.3 - 1.9 * k / NPT) * S * 0.7
+				local f1 = p1 + flatDir(fa) * fl
+				addSeg(p1, f1, dist[k + 1], dist[k + 1] + fl, w, w * 0.5, tint + 0.06, false)
+				local f2 = f1 + flatDir(fa + rng:NextNumber(-0.5, 0.5)) * fl * 0.7
+				addSeg(f1, f2, dist[k + 1] + fl, dist[k + 1] + fl * 1.7, w * 0.5, 0.05 * S, tint + 0.1, false)
+			end
+		end
+		a = ang
+		maxLen = math.max(maxLen, L)
+		cracks[i] = { pts = pts, dist = dist, tint = tint }
+	end
+	local function crackPoint(c: Crack, d: number): Vector3
+		for k = 2, #c.pts do
+			if d <= c.dist[k] then
+				return c.pts[k - 1]:Lerp(c.pts[k], math.clamp((d - c.dist[k - 1]) / (c.dist[k] - c.dist[k - 1]), 0, 1))
+			end
+		end
+		return c.pts[#c.pts]
+	end
+
+	-- black lightning round the crater: a coloured glow with a black core on the same jagged path
+	local bolts = {}
+	for i = 1, 7 do
+		bolts[i] = { glow = Kit.bolt(ctx, "HakiGlow", 6, 1, 1), core = Kit.bolt(ctx, "HakiCore", 6, 2, 0) }
+	end
+
+	-- dark stone thrown up; every chunk flies a fixed arc and has landed by 1.2 s
+	local chunks: { Chunk } = {}
+	for i = 1, 30 do
+		local giant = i <= 5
+		local sz = (if giant then rng:NextNumber(3.6, 5.4) else rng:NextNumber(0.9, 2.8)) * S
+		local base = Vector3.new(sz * rng:NextNumber(0.7, 1.2), sz * rng:NextNumber(0.5, 1), sz * rng:NextNumber(0.7, 1.2))
+		local p = Kit.part(ctx, ctx.root, "Rock", base, Color3.new(), Enum.Material.Slate)
+		local T = if giant then rng:NextNumber(0.78, 0.94) else rng:NextNumber(0.5, 0.94)
+		chunks[i] = { part = p, base = base, dir = flatDir(rng:NextNumber(0, math.pi * 2)), r0 = rng:NextNumber(1.5, 8) * S,
+			run = (if giant then rng:NextNumber(4, 10) else rng:NextNumber(6, 24)) * S, T = T, H = 150 * S * T * T / 8,
+			delay = rng:NextNumber(0, 0.05), spin = Vector3.new(rng:NextNumber(-9, 9), rng:NextNumber(-9, 9), rng:NextNumber(-9, 9)),
+			tint = rng:NextNumber() }
+	end
+
+	-- particles ------------------------------------------------------------------------------------------------
+	local dustRing = Kit.burst(ctx, "DustRing", { tex = "smoke_puff", life = { 0.7, 1.25 }, size = { { 0, 3 }, { 1, 12 } },
+		transp = { { 0, 0.3 }, { 0.5, 0.62 }, { 1, 1 } }, speed = { 48, 92 }, drag = 3.2, rot = { 0, 360 }, rotSpeed = { -70, 70 }, le = 0 })
+	local dustUp = Kit.burst(ctx, "DustUp", { tex = "smoke_puff", life = { 0.8, 1.4 }, size = { { 0, 2.5 }, { 1, 10 } },
+		transp = { { 0, 0.4 }, { 0.5, 0.68 }, { 1, 1 } }, speed = { 24, 70 }, spread = 32, drag = 2.6, acc = Vector3.new(0, -12 * S, 0),
+		rot = { 0, 360 }, rotSpeed = { -50, 50 }, le = 0 })
+	local sparks = Kit.burst(ctx, "Sparks", { tex = "spark_streak", life = { 0.35, 0.75 }, size = { { 0, 0.5 }, { 0.2, 2.6 }, { 1, 0.3 } },
+		transp = { { 0, 0 }, { 0.6, 0.15 }, { 1, 1 } }, speed = { 50, 125 }, spread = 62, drag = 2.4, acc = Vector3.new(0, -95 * S, 0),
+		rot = { 90 }, vpar = true, bright = 2.5 })
+	local lines = Kit.burst(ctx, "SpeedLines", { tex = "spark_streak", life = { 0.14, 0.22 }, size = { { 0, 0.8 }, { 0.3, 5.5 }, { 1, 0.6 } },
+		transp = { { 0, 0.1 }, { 0.6, 0.3 }, { 1, 1 } }, speed = { 130, 190 }, rot = { 90 }, vpar = true, bright = 2 })
+	local glints = Kit.burst(ctx, "Glints", { tex = "spark_glint", life = { 0.25, 0.55 }, size = { { 0, 0 }, { 0.2, 2 }, { 1, 0 } },
+		speed = { 18, 46 }, drag = 3.5, rot = { 0, 360 }, rotSpeed = { -160, 160 }, bright = 3 })
+	local embers = Kit.burst(ctx, "Embers", { tex = "spark_glint", life = { 0.6, 1.0 }, size = { { 0, 0 }, { 0.15, 0.7 }, { 1, 0 } },
+		speed = { 4, 11 }, spread = 16, acc = Vector3.new(0, 8 * S, 0), rot = { 0, 360 }, rotSpeed = { -120, 120 }, bright = 2.5 })
+	local landPuff = Kit.burst(ctx, "LandPuff", { tex = "smoke_puff", life = { 0.4, 0.7 }, size = { { 0, 1.2 }, { 1, 4.5 } },
+		transp = { { 0, 0.45 }, { 0.5, 0.7 }, { 1, 1 } }, speed = { 8, 16 }, drag = 3, rot = { 0, 360 }, le = 0 })
+
+	local grade = Kit.grade(ctx)
+	local lightPart = Kit.part(ctx, ctx.root, "Light", Vector3.one * 0.2, Color3.new(), Enum.Material.SmoothPlastic)
+	lightPart.Transparency = 1
+	lightPart.CFrame = CFrame.new(G + UP * 4 * S)
+	local light = Kit.light(ctx, lightPart, 46 * S)
+
+	local once = Kit.once()
+	local nDown, nTip, nEmber = 0, 0, 0
+
+	return function(t: number)
+		local h = Kit.hue(ctx, t, 0)
+		local ts = t - SLAM -- time since the slam
+		local hitNow = ts >= 0
+
+		-- comet --------------------------------------------------------------------------------------------
+		if not hitNow then
+			local u = Kit.easeIn(t / SLAM)
+			local head = G + UP * (58 * (1 - u) + 0.6) * S
+			cometGlow.beam.Color = ColorSequence.new(Kit.hot(h))
+			cometGlow.set(head, (6 + 7 * u) * S, 0.1)
+			cometStar.beam.Color = ColorSequence.new(Kit.hot(h + 0.2))
+			cometStar.set(head, (10 + 12 * u) * S, 0.05, t * 9)
+			cA0.CFrame = CFrame.new(head)
+			cA1.CFrame = CFrame.new(head + UP * (18 + 26 * u) * S)
+			cometInk.Width0, cometInk.Width1 = 9 * S, 0
+			cometInk.Color = ColorSequence.new(Kit.ink(h))
+			cometInk.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.25), NumberSequenceKeypoint.new(1, 1) })
+			cometTail.Width0, cometTail.Width1 = 6 * S, 0
+			cometTail.Color = Kit.seq(ctx, h, 0.6, 0.85, 1, 5)
+			cometTail.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.1), NumberSequenceKeypoint.new(1, 1) })
+			cometCore.Width0, cometCore.Width1 = 2.4 * S, 0
+			cometCore.Color = ColorSequence.new(Kit.hot(h))
+			cometCore.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0), NumberSequenceKeypoint.new(1, 1) })
+			cometInk.Enabled, cometTail.Enabled, cometCore.Enabled = true, true, true
+			for i, ring in closeRings do
+				local ru = Kit.ramp(t, (i - 1) * 0.07, SLAM)
+				ring.beam.Color = Kit.seq(ctx, Kit.hue(ctx, t, i * 0.3), 0.4, 0.8, 1, 4)
+				ring.set(G, UP, (34 - 30 * Kit.easeIn(ru)) * S, if ru <= 0 then 1 else 0.75 - 0.6 * ru, t * 5 + i)
+			end
+			local want = math.floor(t / 0.02)
+			if want > nDown then
+				nDown = want
+				streakDown.Color = ColorSequence.new(Kit.col(Kit.hue(ctx, t, rng:NextNumber()), 0.6, 1), Kit.hot(h))
+				for _ = 1, 3 do
+					local off = flatDir(rng:NextNumber(0, 6.28)) * rng:NextNumber(1, 9) * S
+					ctx.host.CFrame = Kit.upTo(G + off + UP * rng:NextNumber(20, 30) * S, -UP)
+					streakDown:Emit(1)
+				end
+			end
+		else
+			cometGlow.hide()
+			cometStar.hide()
+			cometInk.Enabled, cometTail.Enabled, cometCore.Enabled = false, false, false
+			for _, ring in closeRings do
+				ring.hide()
+			end
+		end
+
+		-- slam: one-shot layers ------------------------------------------------------------------------------
+		if once("slam", t, SLAM) then
+			shock1.fire(SLAM, G, Kit.seq(ctx, h, 0.7, 0.55, 1, 6))
+			shockInk.fire(SLAM, G, ColorSequence.new(Kit.ink(h)))
+			crater.fire(SLAM, G + UP * 0.02, ColorSequence.new(Color3.fromHSV((h + 0.6) % 1, 0.5, 0.05)))
+			craterHot.fire(SLAM, G + UP * 0.03, Kit.seq(ctx, h, 0.8, 0.6, 1, 6))
+			local dustCol = ColorSequence.new(Color3.fromHSV(h, 0.16, 0.62), Color3.fromHSV(h, 0.1, 0.4))
+			Kit.spray(ctx, dustRing, G + UP * 1.2 * S, 46, dustCol, "disc", 3, 0.08)
+			Kit.spray(ctx, dustRing, G + UP * 1.5 * S, 22, dustCol, "disc", 2, 0.5)
+			Kit.spray(ctx, dustUp, G + UP * S, 18, dustCol, "point", 0, 0, UP)
+			Kit.spray(ctx, sparks, G + UP * 0.5 * S, 60, ColorSequence.new(Kit.hot(h), Kit.col(h + 0.25, 0.8, 1)), "point", 0, 0, UP)
+			Kit.spray(ctx, lines, G + UP * 0.7 * S, 40, ColorSequence.new(Kit.hot(h), Kit.col(h + 0.4, 0.7, 1)), "disc", 4, 0.04)
+			Kit.spray(ctx, glints, G + UP * 2 * S, 34, ColorSequence.new(Kit.hot(h), Kit.col(h + 0.15)), "sphere", 3)
+		end
+		if once("shock2", t, SLAM + 0.07) then
+			shock2.fire(SLAM + 0.07, G, Kit.seq(ctx, h + 0.3, 0.6, 0.7, 1, 5))
+		end
+		if once("shock3", t, SLAM + 0.16) then
+			shock3.fire(SLAM + 0.16, G, Kit.seq(ctx, h + 0.6, 0.5, 0.75, 1, 5))
+		end
+		shock1.update(t)
+		shock2.update(t)
+		shock3.update(t)
+		shockInk.update(t)
+		crater.update(t)
+		craterHot.update(t)
+
+		-- flash, pillar, sky rings, pressure dome ------------------------------------------------------------
+		local f = if hitNow then 1 - Kit.ramp(ts, 0, 0.14) else 0
+		flash.beam.Color = ColorSequence.new(Kit.hot(h))
+		flash.set(G + UP * 2 * S, (24 + 60 * f) * S, 1 - f)
+		star.beam.Color = ColorSequence.new(Color3.new(1, 1, 1))
+		star.set(G + UP * 2 * S, 70 * S * f, if f > 0 then 0 else 1, 0.5, 1)
+		star2.beam.Color = ColorSequence.new(Kit.hot(h + 0.3))
+		star2.set(G + UP * 2 * S, 46 * S * f, if f > 0 then 0.1 else 1, 0.5 + math.pi / 4 + ts * 4, 1)
+
+		local pu = Kit.ramp(ts, 0, 0.5)
+		if hitNow and pu < 1 then
+			pA0.CFrame = CFrame.new(G)
+			pA1.CFrame = CFrame.new(G + UP * (24 + 80 * Kit.easeOut(Kit.ramp(ts, 0, 0.1))) * S)
+			local thin = (1 - pu) ^ 1.6
+			pillarInk.Width0, pillarInk.Width1 = 20 * thin * S, 9 * thin * S
+			pillarInk.Color = ColorSequence.new(Kit.ink(h))
+			pillarInk.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.2 + 0.5 * pu), NumberSequenceKeypoint.new(1, 1) })
+			pillar.Width0, pillar.Width1 = 14 * thin * S, 5 * thin * S
+			pillar.Color = Kit.seq(ctx, h, 0.7, 0.85, 1, 6)
+			pillar.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.1 + 0.5 * pu), NumberSequenceKeypoint.new(1, 1) })
+			pillarCore.Width0, pillarCore.Width1 = 5.5 * thin * S, 1.2 * thin * S
+			pillarCore.Color = ColorSequence.new(Kit.hot(h))
+			pillarCore.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.4 * pu), NumberSequenceKeypoint.new(1, 1) })
+			pillarInk.Enabled, pillar.Enabled, pillarCore.Enabled = true, true, true
+		else
+			pillarInk.Enabled, pillar.Enabled, pillarCore.Enabled = false, false, false
+		end
+		for i, ring in skyRings do
+			local u = Kit.ramp(ts, 0.02 + (i - 1) * 0.05, 0.4 + (i - 1) * 0.08)
+			ring.beam.Color = Kit.seq(ctx, Kit.hue(ctx, t, i * 0.25), 0.5, 0.7, 1, 5)
+			Kit.pulse(ring, G + UP * (9 + 13 * i) * S, UP, u, 5 * S, (52 - 9 * i) * S, 0.1, i * 2)
+		end
+		local du = Kit.ramp(ts, 0, 0.3)
+		if hitNow and du < 1 then
+			dome.Size = Vector3.one * (8 + 62 * Kit.easeOut(du)) * S
+			dome.CFrame = CFrame.new(G)
+			dome.Color = Kit.col(h, 0.5, 1)
+			dome.Transparency = du * du
+		else
+			dome.CFrame = Kit.HIDE
+		end
+		local dg = if hitNow then 1 - Kit.ramp(ts, 0.15, 1.3) else 0
+		glowDisc.beam.Color = Kit.hueSeq(h, if ctx.opts.rainbow then 0.8 else 0.08, 0.85, 1, 6)
+		glowDisc.set(G, UP, (30 + 16 * Kit.easeOut(Kit.ramp(ts, 0, 0.3))) * S, 1 - 0.55 * dg, t * 0.6)
+
+		-- cracks ---------------------------------------------------------------------------------------------
+		local front = maxLen * Kit.easeOut(Kit.ramp(ts, 0, RACE))
+		local cool = Kit.ramp(ts, 0.7, 1.35) -- seams lose their heat
+		local gone = Kit.ramp(t, life - 0.4, life)
+		local flick = 0.75 + 0.25 * Kit.slotRng(seed, t, 1 / 30):NextNumber()
+		local wallH = (1.3 + 9 * math.exp(-math.max(ts, 0) * 6)) * S * (1 - cool)
+		for _, s in segs do
+			local fr = if hitNow then math.clamp((front - s.d0) / (s.d1 - s.d0), 0, 1) else 0
+			if fr <= 0 then
+				s.ink.Enabled, s.hot.Enabled = false, false
+				if s.wall then
+					s.wall.Enabled = false
+				end
+				continue
+			end
+			local along = (s.p1 - s.p0).Unit
+			local side = along:Cross(UP).Unit
+			local pe = s.p0:Lerp(s.p1, fr)
+			local we = s.wide0 + (s.wide1 - s.wide0) * fr
+			s.a0.CFrame = CFrame.fromMatrix(s.p0, along, side)
+			s.a1.CFrame = CFrame.fromMatrix(pe, along, side)
+			local hs = Kit.hue(ctx, t, s.tint)
+			s.ink.Width0, s.ink.Width1 = s.wide0 * 2.7, we * 2.7
+			s.ink.Color = ColorSequence.new(Color3.fromHSV((hs + 0.5) % 1, 0.7, 0.07))
+			s.ink.Transparency = NumberSequence.new(0.05 + 0.95 * gone)
+			s.hot.Width0, s.hot.Width1 = s.wide0 * (1.25 - 0.5 * cool), we * (1.25 - 0.5 * cool)
+			s.hot.Color = ColorSequence.new(Kit.hot(hs):Lerp(Kit.col(hs, 0.9, 1), 0.25 + 0.75 * cool))
+			s.hot.Transparency = NumberSequence.new(math.clamp(1 - flick * (1 - 0.85 * cool) + gone, 0, 1))
+			s.ink.Enabled, s.hot.Enabled = true, true
+			if s.wall and s.w0 and s.w1 then
+				if wallH > 0.05 * S then
+					s.w0.CFrame = CFrame.fromMatrix(s.p0, along, UP)
+					s.w1.CFrame = CFrame.fromMatrix(pe, along, UP)
+					local k = math.max(0.25, s.wide0 / (2.3 * S))
+					s.wall.Width0, s.wall.Width1 = wallH * 2 * k, wallH * 2 * math.max(0.2, we / (2.3 * S))
+					s.wall.Color = ColorSequence.new(Kit.col(hs, 0.75, 1))
+					s.wall.Transparency = NumberSequence.new(math.clamp(0.3 + 0.2 * (1 - flick) + 0.7 * cool, 0, 1))
+					s.wall.Enabled = true
+				else
+					s.wall.Enabled = false
+				end
+			end
+		end
+		-- sparks thrown off each racing crack tip
+		if hitNow and ts < RACE then
+			local want = math.floor(ts / 0.035) + 1
+			if want > nTip then
+				nTip = want
+				for _, c in cracks do
+					local p = crackPoint(c, front)
+					local hs = Kit.hue(ctx, t, c.tint)
+					Kit.spray(ctx, glints, p + UP * 0.5 * S, 2, ColorSequence.new(Kit.hot(hs), Kit.col(hs, 0.9, 1)), "sphere", 0.5)
+					Kit.spray(ctx, sparks, p + UP * 0.3 * S, 2, ColorSequence.new(Kit.hot(hs), Kit.col(hs + 0.1, 0.9, 1)), "point", 0, 0, UP)
+				end
+			end
+		end
+		-- embers drifting out of the seams while they cool
+		if ts > 0.3 and ts < 1.25 then
+			local want = math.floor((ts - 0.3) / 0.04)
+			if want > nEmber then
+				nEmber = want
+				for _ = 1, 3 do
+					local c = cracks[rng:NextInteger(1, #cracks)]
+					local hs = Kit.hue(ctx, t, c.tint)
+					Kit.spray(ctx, embers, crackPoint(c, rng:NextNumber(2 * S, c.dist[#c.dist])), 1, ColorSequence.new(Kit.hot(hs), Kit.col(hs, 0.9, 1)), "point", 0, 0, UP)
+				end
+			end
+		end
+
+		-- black lightning --------------------------------------------------------------------------------------
+		local slot = math.floor(t / 0.05)
+		local alive = if hitNow then 1 - Kit.ramp(ts, 0.12, 0.8) else 0
+		for i, b in bolts do
+			local r = Random.new(seed * 131 + i * 977 + slot * 31)
+			if alive > 0 and r:NextNumber() < 0.35 + 0.6 * alive then
+				local a = r:NextNumber(0, math.pi * 2)
+				local el = r:NextNumber(0.15, 1.25)
+				local tip = G + (flatDir(a) * math.cos(el) + UP * math.sin(el)) * r:NextNumber(12, 30) * S
+				local from = G + flatDir(a + r:NextNumber(-0.6, 0.6)) * r:NextNumber(0, 5) * S
+				local sd = seed * 53 + i * 101 + slot
+				b.glow.set(from, tip, 3.4 * S, 0.1, sd, Kit.col(Kit.hue(ctx, t, i / #bolts), 0.9, 1), 0.25)
+				b.core.set(from, tip, 1.1 * S, 0.1, sd, Color3.new(0, 0, 0), 0)
+			else
+				b.glow.hide()
+				b.core.hide()
+			end
+		end
+
+		-- rock ---------------------------------------------------------------------------------------------
+		local shrink = 1 - Kit.ramp(t, life - 0.38, life - 0.03)
+		for i, c in chunks do
+			local tt = ts - c.delay
+			if tt < 0 or shrink <= 0.02 then
+				c.part.CFrame = Kit.HIDE
+				continue
+			end
+			local u = math.min(tt / c.T, 1)
+			local rest = c.base.Y * 0.28 * shrink
+			local y = 4 * c.H * u * (1 - u) + rest
+			local pos = G + c.dir * (c.r0 + c.run * u) + UP * y
+			local sp = math.min(tt, c.T)
+			c.part.Size = c.base * shrink
+			c.part.CFrame = CFrame.new(pos) * CFrame.Angles(c.spin.X * sp, c.spin.Y * sp, c.spin.Z * sp)
+			c.part.Color = Color3.fromHSV((h + 0.5 + c.tint * 0.2) % 1, 0.45, 0.13 + 0.1 * c.tint)
+			if once("land" .. i, t, SLAM + c.delay + c.T) and i % 2 == 0 then
+				Kit.spray(ctx, landPuff, G + c.dir * (c.r0 + c.run) + UP * 0.6 * S, 3, ColorSequence.new(Color3.fromHSV(h, 0.14, 0.55)), "disc", 1, 0.3)
+			end
+		end
+
+		-- scene grade and light ------------------------------------------------------------------------------
+		if grade then
+			local k1 = if hitNow then math.exp(-ts * 22) else 0
+			local k2 = if hitNow then math.exp(-ts * 5) else 0
+			grade.Brightness = 0.4 * k1
+			grade.Contrast = 0.45 * k2
+			grade.Saturation = 0.35 * k2
+		end
+		light.Color = Kit.col(h, 0.45, 1)
+		light.Brightness = if hitNow then (9 * math.exp(-ts * 7) + 2.2 * (1 - cool)) * (1 - gone) else 2 * t / SLAM
+	end
+end
+
+-- a brutal kick on the slam, then the ground keeps rumbling while the rock is in the air
+function QuakeSlam.shake(t: number): Vector3
+	if t < SLAM or t > 1.3 then
+		return Vector3.zero
+	end
+	local k = 1.2 * math.exp(-(t - SLAM) * 6) + 0.06 * (1 - (t - SLAM) / 1.1)
+	return Vector3.new(math.sin(t * 67) * k * 0.6, math.cos(t * 83) * k, 0)
+end
+
+return QuakeSlam
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="18">
+          <Properties>
+            <string name="Name">RiftGate</string>
+            <string name="Source"><![CDATA[--!strict
+--[[ RiftGate: a standing portal torn into the air.
+	cf = the centre of the gate; cf.LookVector is the way it faces (cf.UpVector is its top, so it can lean or lie flat).
+	No caster, no pose.
+
+	0.00-0.26  two spark heads race from the bottom of the rim round both sides to the top, burning it in behind them
+	0.26-0.40  they meet: flash, a shock ring in the plane of the gate, the ring snaps out to full size, the inside floods in
+	0.40-4.40  hold: a burning rim (dark halo, rainbow running round it, white core) with two comets chasing each other
+	           round it, flame tongues licking off it, a deep swirl inside (spiral arms over turning cloud), motes
+	           falling inward, sparks shed off the comets, pulse rings, black lightning grounding from the lower rim
+	last 0.30  it folds shut sideways into a vertical line of light, the line snaps to a point and pops
+	handle.stop() plays the fold from wherever it is; a second stop() removes it at once. ]]
+local Workspace = game:GetService("Workspace")
+local Kit = require(script.Parent.Parent.Kit)
+
+local OPEN = 0.4
+local HOLD = 4.0
+local CLOSE = 0.3
+local MEET = 0.26 -- the spark heads meet at the top
+local SPIN = 5 -- comet speed round the rim, rad/s
+local N = 24 -- rim segments
+
+local RiftGate = {
+	life = OPEN + HOLD + CLOSE,
+	required = { "glow_soft", "spark_streak", "spark_glint", "shock_ring", "ground_crack", "ground_disc", "frost_ground", "bolt_glow" },
+}
+
+type Tongue = { a0: Attachment, a1: Attachment, b: Beam, ang: number, len: number, w: number, out: number, p1: number, p2: number, f1: number, f2: number }
+type Arm = { a0: Attachment, a1: Attachment, b: Beam, ang: number }
+
+function RiftGate.build(ctx: Kit.Ctx): (number) -> ()
+	local S = ctx.opts.scale
+	local rng = ctx.rng
+	local seed = ctx.opts.seed
+	local life = RiftGate.life
+	ctx.outro = CLOSE
+
+	local C = ctx.cf.Position
+	local nrm = ctx.cf.LookVector
+	local right = ctx.cf.RightVector
+	local up = ctx.cf.UpVector
+	local R = 7.5 * S
+	local dth = math.pi * 2 / N
+
+	-- angle 0 is the bottom of the ring
+	local function radial(a: number): Vector3
+		return right * math.sin(a) - up * math.cos(a)
+	end
+	local function tangent(a: number): Vector3
+		return right * math.cos(a) + up * math.sin(a)
+	end
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local ex: { Instance } = { ctx.root }
+	local folder = Workspace:FindFirstChild("wakuVFX")
+	if folder then
+		table.insert(ex, folder)
+	end
+	params.FilterDescendantsInstances = ex
+	local hit = Workspace:Raycast(C, Vector3.new(0, -R * 3, 0), params)
+	local G: Vector3? = if hit then hit.Position + Vector3.yAxis * 0.08 else nil
+
+	-- rim: a closed loop of curved segments, three layers sharing one set of joints -----------------------------
+	local rimAtt: { Attachment } = {}
+	for i = 1, N do
+		rimAtt[i] = Kit.att(ctx)
+	end
+	local function rimLayer(name: string, z: number, le: number, bright: number): { Beam }
+		local list = {}
+		for i = 1, N do
+			local b = Kit.beam(ctx, rimAtt[i], rimAtt[i % N + 1], "bolt_glow", z)
+			b.Name = name
+			b.Segments = 4
+			b.LightEmission = le
+			b.Brightness = bright
+			b.Enabled = false
+			list[i] = b
+		end
+		return list
+	end
+	local rimInk = rimLayer("RimInk", -1, 0, 1)
+	local rimBody = rimLayer("Rim", 1, 1, 1.6)
+	local rimCore = rimLayer("RimCore", 2, 1, 3)
+
+	-- flame tongues licking off the rim (outward) and into the gate (inward)
+	local tongues: { Tongue } = {}
+	local function addTongues(n: number, out: number, len: { number }, w: { number })
+		for i = 1, n do
+			local a0, a1 = Kit.att(ctx), Kit.att(ctx)
+			local b = Kit.beam(ctx, a0, a1, "bolt_glow", 0)
+			b.Name = if out > 0 then "RimFlame" else "RimFlameIn"
+			b.Segments = 8
+			b.Width1 = 0
+			b.Enabled = false
+			table.insert(tongues, { a0 = a0, a1 = a1, b = b, ang = (i - 1) / n * math.pi * 2 + rng:NextNumber(-0.12, 0.12),
+				len = rng:NextNumber(len[1], len[2]) * S, w = rng:NextNumber(w[1], w[2]) * S, out = out,
+				p1 = rng:NextNumber(0, 6.28), p2 = rng:NextNumber(0, 6.28), f1 = rng:NextNumber(11, 17), f2 = rng:NextNumber(19, 27) })
+		end
+	end
+	addTongues(20, 1, { 2.4, 5.6 }, { 1.5, 2.3 })
+	addTongues(12, -1, { 1.4, 2.8 }, { 1.0, 1.5 })
+
+	-- the inside: cards lying in the plane of the gate ----------------------------------------------------------
+	local function card(name: string, tex: string, z: number, le: number, bright: number?): (Beam, (number, number, number, number?) -> ())
+		local a0, a1 = Kit.att(ctx), Kit.att(ctx)
+		local b = Kit.beam(ctx, a0, a1, tex, z)
+		b.Name = name
+		b.FaceCamera = false
+		b.Segments = 1
+		b.LightEmission = le
+		b.Brightness = bright or 1
+		b.Enabled = false
+		return b, function(wx: number, wy: number, transp: number, rot: number?)
+			if transp >= 0.995 or wx <= 0.02 or wy <= 0.02 then
+				b.Enabled = false
+				return
+			end
+			local x, y = right, up
+			if rot then
+				local c, s = math.cos(rot), math.sin(rot)
+				x, y = right * c + up * s, up * c - right * s
+			end
+			a0.CFrame = CFrame.fromMatrix(C - x * wx / 2, x, y)
+			a1.CFrame = CFrame.fromMatrix(C + x * wx / 2, x, y)
+			b.Width0, b.Width1 = wy, wy
+			b.Transparency = NumberSequence.new(math.clamp(transp, 0, 1))
+			b.Enabled = true
+		end
+	end
+	local voidA, setVoidA = card("Void", "ground_disc", -6, 0)
+	local voidB, setVoidB = card("Void", "ground_disc", -5.8, 0)
+	local cloudA, setCloudA = card("SwirlCloud", "frost_ground", -5, 1)
+	local cloudB, setCloudB = card("SwirlCloud2", "frost_ground", -4.6, 1)
+	local veins, setVeins = card("SwirlVeins", "ground_crack", -4.2, 1, 2)
+	local heart, setHeart = card("Heart", "glow_soft", -3, 1, 2)
+	local heartStar, setHeartStar = card("HeartStar", "spark_glint", -2.6, 1, 3)
+
+	local arms: { Arm } = {}
+	local arms2: { Arm } = {}
+	local function addArms(list: { Arm }, n: number, name: string, z: number)
+		for i = 1, n do
+			local a0, a1 = Kit.att(ctx), Kit.att(ctx)
+			local b = Kit.beam(ctx, a0, a1, "bolt_glow", z)
+			b.Name = name
+			b.FaceCamera = false
+			b.Segments = 14
+			b.Enabled = false
+			table.insert(list, { a0 = a0, a1 = a1, b = b, ang = (i - 1) / n * math.pi * 2 })
+		end
+	end
+	addArms(arms, 6, "SwirlArm", -3.8)
+	addArms(arms2, 4, "SwirlArmHot", -3.4)
+
+	-- camera-facing pieces --------------------------------------------------------------------------------------
+	local bloom = Kit.sprite(ctx, "Bloom", "glow_soft", -7)
+	local heads = { { glow = Kit.sprite(ctx, "HeadGlow", "glow_soft", 4), star = Kit.sprite(ctx, "HeadStar", "spark_glint", 5) },
+		{ glow = Kit.sprite(ctx, "HeadGlow", "glow_soft", 4), star = Kit.sprite(ctx, "HeadStar", "spark_glint", 5) } }
+	local meetFlash = Kit.sprite(ctx, "MeetFlash", "glow_soft", 6)
+	local meetStar = Kit.sprite(ctx, "MeetStar", "spark_glint", 7)
+	local popStar = Kit.sprite(ctx, "PopStar", "spark_glint", 7)
+	local popLine = Kit.sprite(ctx, "PopLine", "spark_glint", 7)
+	local openRing = Kit.plate(ctx, "OpenRing", "shock_ring", 3)
+	local openRing2 = Kit.plate(ctx, "OpenRingInk", "shock_ring", 2)
+	openRing2.beam.LightEmission = 0
+	local pulses = { Kit.plate(ctx, "Pulse", "shock_ring", -1), Kit.plate(ctx, "Pulse", "shock_ring", -1) }
+	local groundGlow = Kit.plate(ctx, "GroundGlow", "ground_disc", 0.2)
+	local groundRipple = Kit.plate(ctx, "GroundRipple", "shock_ring", 0.4)
+	local bolts = {}
+	for i = 1, 3 do
+		bolts[i] = { glow = Kit.bolt(ctx, "HakiGlow", 6, 1, 1), core = Kit.bolt(ctx, "HakiCore", 6, 2, 0) }
+	end
+
+	local sparks = Kit.burst(ctx, "RimSparks", { tex = "spark_streak", life = { 0.3, 0.65 }, size = { { 0, 0.35 }, { 0.2, 1.7 }, { 1, 0.2 } },
+		transp = { { 0, 0 }, { 0.6, 0.15 }, { 1, 1 } }, speed = { 26, 62 }, spread = 28, drag = 2, acc = Vector3.new(0, -62 * S, 0),
+		rot = { 90 }, vpar = true, bright = 2.5 })
+	local glints = Kit.burst(ctx, "Glints", { tex = "spark_glint", life = { 0.25, 0.5 }, size = { { 0, 0 }, { 0.2, 1.5 }, { 1, 0 } },
+		speed = { 10, 30 }, drag = 3.5, rot = { 0, 360 }, rotSpeed = { -160, 160 }, bright = 3 })
+	local motes = Kit.burst(ctx, "Motes", { tex = "spark_glint", life = { 0.42, 0.5 }, size = { { 0, 0 }, { 0.25, 0.9 }, { 1, 0 } },
+		speed = { 12, 15 }, rot = { 0, 360 }, rotSpeed = { -200, 200 }, bright = 2.5 })
+	local moteStreak = Kit.burst(ctx, "MoteStreaks", { tex = "spark_streak", life = { 0.3, 0.4 }, size = { { 0, 0.2 }, { 0.3, 1.5 }, { 1, 0.1 } },
+		transp = { { 0, 1 }, { 0.3, 0.1 }, { 1, 0.6 } }, speed = { 15, 20 }, rot = { 90 }, vpar = true, bright = 2 })
+
+	local lightPart = Kit.part(ctx, ctx.root, "Light", Vector3.one * 0.2, Color3.new(), Enum.Material.SmoothPlastic)
+	lightPart.Transparency = 1
+	lightPart.CFrame = CFrame.new(C + nrm * 1.5 * S)
+	local light = Kit.light(ctx, lightPart, 34 * S)
+
+	local once = Kit.once()
+	local nHead, nShed, nMote = 0, 0, 0
+	local kk: { number } = table.create(N + 1, 0)
+	local lit: { number } = table.create(N + 1, 0)
+	local hh: { number } = table.create(N + 1, 0)
+	local hl: { number } = table.create(N + 1, 0)
+
+	return function(t: number)
+		local h = Kit.hue(ctx, t, 0)
+		local closeAt = ctx.stopAt or (life - CLOSE)
+		local tc = t - closeAt
+		local closing = tc >= 0
+
+		-- shape of the ring this frame ---------------------------------------------------------------------------
+		local g = 0.8 + 0.2 * Kit.easeOutBack(Kit.ramp(t, MEET - 0.08, OPEN))
+		local sx, sy = 1, 1
+		if closing then
+			sx = 1 - 0.985 * Kit.easeIn(Kit.ramp(tc, 0, 0.16))
+			sy = (1 + 0.32 * Kit.smooth(Kit.ramp(tc, 0, 0.16))) * (1 - Kit.easeIn(Kit.ramp(tc, 0.14, 0.26)))
+		end
+		local function point(a: number, rf: number): Vector3
+			return C + right * (math.sin(a) * R * rf * g * sx) - up * (math.cos(a) * R * rf * g * sy)
+		end
+		local burn = (math.pi + 2 * dth) * Kit.ramp(t, 0, MEET) ^ 0.85 -- how far round the rim is lit (overshoots, so the top is fully lit)
+		local hd = math.min(burn, math.pi) -- where the two spark heads are
+		local inside = Kit.easeOut(Kit.ramp(t, MEET - 0.04, OPEN + 0.08)) * (if closing then 1 - Kit.ramp(tc, 0, 0.13) else 1)
+		local rimFade = if closing then Kit.ramp(tc, 0.23, 0.29) else 0
+		local flick = 0.86 + 0.14 * Kit.slotRng(seed, t, 1 / 30):NextNumber()
+
+		-- rim ----------------------------------------------------------------------------------------------------
+		local kcurve = 4 / 3 * math.tan(dth / 4)
+		for i = 1, N do
+			local a = -math.pi + (i - 1) * dth
+			local tv = right * (math.cos(a) * sx) + up * (math.sin(a) * sy)
+			rimAtt[i].CFrame = Kit.rightTo(point(a, 1), tv)
+			hl[i] = kcurve * R * g * tv.Magnitude
+			kk[i] = (0.5 + 0.5 * math.cos(a - t * SPIN)) ^ 8 + (0.5 + 0.5 * math.cos(a - t * SPIN - math.pi)) ^ 8
+			lit[i] = math.clamp((burn - math.abs(a)) / dth + 0.5, 0, 1)
+			hh[i] = Kit.hue(ctx, t, (i - 1) / N)
+		end
+		kk[N + 1], lit[N + 1], hl[N + 1] = kk[1], lit[1], hl[1]
+		hh[N + 1] = Kit.hue(ctx, t, 1)
+		local squash = if closing then 0.35 + 0.65 * math.max(sx, 0.05) else 1 -- thinner as it folds to a line
+		for i = 1, N do
+			local l0, l1 = lit[i], lit[i + 1]
+			if l0 <= 0 and l1 <= 0 then
+				rimInk[i].Enabled, rimBody[i].Enabled, rimCore[i].Enabled = false, false, false
+				continue
+			end
+			local k0, k1 = kk[i], kk[i + 1]
+			for _, b in { rimInk[i], rimBody[i], rimCore[i] } do
+				b.CurveSize0, b.CurveSize1 = hl[i], hl[i + 1]
+				b.Enabled = true
+			end
+			local function tr(base0: number, base1: number): NumberSequence
+				return NumberSequence.new({
+					NumberSequenceKeypoint.new(0, math.clamp(1 - (1 - base0) * l0 * (1 - rimFade), 0, 1)),
+					NumberSequenceKeypoint.new(1, math.clamp(1 - (1 - base1) * l1 * (1 - rimFade), 0, 1)),
+				})
+			end
+			local ink, body, core = rimInk[i], rimBody[i], rimCore[i]
+			ink.Width0, ink.Width1 = (4.2 + 2 * k0) * S * squash, (4.2 + 2 * k1) * S * squash
+			ink.Color = ColorSequence.new(Kit.ink(hh[i]), Kit.ink(hh[i + 1]))
+			ink.Transparency = tr(0.2, 0.2)
+			body.Width0, body.Width1 = (2 + 2.3 * k0) * S * squash * flick, (2 + 2.3 * k1) * S * squash * flick
+			body.Color = ColorSequence.new(Kit.col(hh[i], 0.9 - 0.5 * k0, 1), Kit.col(hh[i + 1], 0.9 - 0.5 * k1, 1))
+			body.Transparency = tr(0.08, 0.08)
+			core.Width0, core.Width1 = (0.6 + 1.3 * k0) * S * squash, (0.6 + 1.3 * k1) * S * squash
+			core.Color = ColorSequence.new(Kit.hot(hh[i]), Kit.hot(hh[i + 1]))
+			core.Transparency = tr(0.3 - 0.3 * k0, 0.3 - 0.3 * k1)
+		end
+
+		-- flame tongues ------------------------------------------------------------------------------------------
+		for _, tg in tongues do
+			local a = tg.ang + 0.1 * math.sin(t * 1.7 + tg.p1)
+			local da = math.abs((a + math.pi) % (2 * math.pi) - math.pi)
+			local on = math.clamp((burn - da) / dth, 0, 1) * (1 - rimFade)
+			if on <= 0 or (closing and sx < 0.5) then
+				tg.b.Enabled = false
+				continue
+			end
+			local nz = 0.5 + 0.25 * math.sin(t * tg.f1 + tg.p1) + 0.25 * math.sin(t * tg.f2 + tg.p2)
+			local comet = (0.5 + 0.5 * math.cos(a - t * SPIN)) ^ 6 + (0.5 + 0.5 * math.cos(a - t * SPIN - math.pi)) ^ 6
+			local len = tg.len * (0.45 + 0.75 * nz + 0.9 * comet)
+			local p0 = point(a, 1)
+			local rad = radial(a) * tg.out
+			local tip = p0 + rad * len - tangent(a) * len * 0.75 -- swept back against the spin
+			tg.a0.CFrame = Kit.rightTo(p0, rad)
+			tg.a1.CFrame = Kit.rightTo(tip, -tangent(a) + rad * 0.2)
+			tg.b.CurveSize0, tg.b.CurveSize1 = len * 0.55, len * 0.35
+			tg.b.Width0 = tg.w * (0.8 + 0.5 * comet)
+			local hc = Kit.hue(ctx, t, (a / (2 * math.pi)) % 1)
+			tg.b.Color = ColorSequence.new(Kit.hot(hc), Kit.col(hc + 0.08, 0.9, 1))
+			tg.b.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1 - 0.85 * on), NumberSequenceKeypoint.new(1, 1) })
+			tg.b.Enabled = true
+		end
+
+		-- inside ---------------------------------------------------------------------------------------------------
+		local d = 2 * R * g
+		local voidCol = ColorSequence.new(Color3.fromHSV((h + 0.62) % 1, 0.85, 0.09))
+		voidA.Color, voidB.Color = voidCol, voidCol
+		local vshow = if closing then 1 - Kit.ramp(tc, 0.12, 0.2) else Kit.ramp(t, MEET - 0.06, OPEN)
+		setVoidA(d * 1.06 * sx, d * 1.06 * sy, 1 - vshow)
+		setVoidB(d * 0.98 * sx, d * 0.98 * sy, 1 - vshow)
+		cloudA.Color = Kit.seq(ctx, h + 0.45, 0.35, 0.8, 0.95, 4)
+		setCloudA(d * 0.97 * inside, d * 0.97 * inside, 1 - 0.6 * inside, t * 0.9)
+		cloudB.Color = Kit.seq(ctx, h + 0.1, 0.4, 0.7, 1, 4)
+		setCloudB(d * 0.74 * inside, d * 0.74 * inside, 1 - 0.55 * inside, -t * 1.5)
+		veins.Color = Kit.seq(ctx, h, 0.8, 0.5, 1, 6)
+		setVeins(d * 0.66 * inside, d * 0.66 * inside, 1 - 0.55 * inside * flick, t * 2.3)
+		local beat = 0.5 + 0.5 * math.sin(t * 7)
+		heart.Color = ColorSequence.new(Kit.hot(h))
+		setHeart(d * (0.42 + 0.06 * beat) * inside, d * (0.42 + 0.06 * beat) * inside, 1 - 0.8 * inside)
+		heartStar.Color = ColorSequence.new(Color3.new(1, 1, 1))
+		setHeartStar(d * (0.5 + 0.1 * beat) * inside, d * (0.5 + 0.1 * beat) * inside, 1 - 0.9 * inside, -t * 2.6)
+
+		local function placeArms(list: { Arm }, spin: number, twist: number, r0: number, r1: number, w: number, hot: boolean)
+			for j, arm in list do
+				if inside <= 0.02 then
+					arm.b.Enabled = false
+					continue
+				end
+				local b0 = arm.ang + t * spin
+				local b1 = b0 + twist
+				local d0 = radial(b0 + twist * 0.35)
+				local d1 = tangent(b1) * (if twist > 0 then 1 else -1)
+				arm.a0.CFrame = CFrame.fromMatrix(point(b0, r0 * inside), d0, nrm:Cross(d0))
+				arm.a1.CFrame = CFrame.fromMatrix(point(b1, r1 * inside), d1, nrm:Cross(d1))
+				arm.b.CurveSize0, arm.b.CurveSize1 = R * 0.42 * inside, R * 0.5 * inside
+				arm.b.Width0, arm.b.Width1 = w * 0.2 * S, w * S * inside
+				local ha = Kit.hue(ctx, t, j / #list)
+				arm.b.Color = if hot then ColorSequence.new(Color3.new(1, 1, 1), Kit.hot(ha)) else Kit.seq(ctx, ha, 0.3, 0.85, 1, 4)
+				arm.b.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1 - 0.75 * inside),
+					NumberSequenceKeypoint.new(0.75, 1 - 0.6 * inside), NumberSequenceKeypoint.new(1, 1) })
+				arm.b.Enabled = true
+			end
+		end
+		placeArms(arms, 2.4, 1.9, 0.07, 0.93, 3.4, false)
+		placeArms(arms2, -3.4, -1.5, 0.05, 0.7, 1.5, true)
+
+		bloom.beam.Color = ColorSequence.new(Kit.col(h + 0.1, 0.6, 1))
+		bloom.set(C, d * 1.9 * math.max(sx, 0.2), 1 - 0.3 * math.max(inside, if closing then 0 else lit[N // 2 + 1] * 0.4) * (1 - rimFade))
+
+		-- opening: the spark heads ---------------------------------------------------------------------------------
+		if t < MEET then
+			for s, head in heads do
+				local a = if s == 1 then hd else -hd
+				local p = point(a, 1)
+				head.glow.beam.Color = ColorSequence.new(Kit.hot(h))
+				head.glow.set(p, 7 * S, 0.15)
+				head.star.beam.Color = ColorSequence.new(Color3.new(1, 1, 1))
+				head.star.set(p, 13 * S, 0, t * 14 * (if s == 1 then 1 else -1))
+			end
+			local want = math.floor(t / 0.011) + 1
+			if want > nHead then
+				nHead = want
+				for s = 1, 2 do
+					local a = if s == 1 then hd else -hd
+					local back = tangent(a) * (if s == 1 then -1 else 1)
+					Kit.spray(ctx, sparks, point(a, 1), 3, ColorSequence.new(Kit.hot(h), Kit.col(Kit.hue(ctx, t, s * 0.3), 0.9, 1)), "point", 0, 0, back + radial(a) * 0.8)
+				end
+			end
+		else
+			-- hold: the two comets ride the rim and shed sparks behind them
+			local show = not closing and t >= OPEN
+			for s, head in heads do
+				local a = t * SPIN + (s - 1) * math.pi
+				if show then
+					local p = point(a, 1)
+					head.glow.beam.Color = ColorSequence.new(Kit.col(Kit.hue(ctx, t, s * 0.5), 0.5, 1))
+					head.glow.set(p, 6 * S, 0.3)
+					head.star.beam.Color = ColorSequence.new(Color3.new(1, 1, 1))
+					head.star.set(p, (7 + 1.5 * math.sin(t * 31 + s)) * S, 0, t * 6)
+				else
+					head.glow.hide()
+					head.star.hide()
+				end
+			end
+			if show then
+				local want = math.floor((t - OPEN) / 0.028) + 1
+				if want > nShed then
+					nShed = want
+					for s = 1, 2 do
+						local a = t * SPIN + (s - 1) * math.pi
+						Kit.spray(ctx, sparks, point(a, 1), 2, ColorSequence.new(Kit.hot(h), Kit.col(Kit.hue(ctx, t, a / 6.28), 0.9, 1)), "point", 0, 0, tangent(a) + radial(a) * 0.5)
+					end
+				end
+			end
+		end
+
+		-- the heads meet: flash, shock ring, sparks off the whole rim ---------------------------------------------
+		if once("meet", t, MEET) then
+			for i = 1, N do
+				local a = -math.pi + (i - 1) * dth
+				Kit.spray(ctx, sparks, point(a, 1), 3, ColorSequence.new(Kit.hot(hh[i]), Kit.col(hh[i], 0.9, 1)), "point", 0, 0, radial(a))
+			end
+			Kit.spray(ctx, glints, point(math.pi, 1), 16, ColorSequence.new(Kit.hot(h), Kit.col(h + 0.2)), "sphere", 2)
+			Kit.spray(ctx, glints, C, 14, ColorSequence.new(Kit.hot(h), Kit.col(h + 0.5)), "sphere", 5)
+		end
+		local mf = if t >= MEET then 1 - Kit.ramp(t, MEET, MEET + 0.16) else 0
+		meetFlash.beam.Color = ColorSequence.new(Kit.hot(h))
+		meetFlash.set(C, d * (1.4 + 1.4 * mf), 1 - 0.85 * mf)
+		meetStar.beam.Color = ColorSequence.new(Color3.new(1, 1, 1))
+		meetStar.set(point(math.pi, 1), 34 * S * mf, if mf > 0 then 0 else 1, 0.3, 1)
+		local ou = Kit.ramp(t, MEET, MEET + 0.42)
+		openRing.beam.Color = Kit.seq(ctx, h, 0.8, 0.6, 1, 6)
+		Kit.pulse(openRing, C, nrm, ou, d * 1.05, d * 2.9, 0.05, 1)
+		openRing2.beam.Color = ColorSequence.new(Kit.ink(h))
+		Kit.pulse(openRing2, C, nrm, Kit.ramp(t, MEET + 0.03, MEET + 0.5), d * 1.1, d * 3.2, 0.2, 2)
+
+		-- hold: pulse rings, motes falling in, black lightning to the ground -----------------------------------------
+		for k, pl in pulses do
+			local u = if t > OPEN and not closing then ((t - OPEN + (k - 1) * 0.6) % 1.2) / 0.75 else 0
+			pl.beam.Color = Kit.seq(ctx, Kit.hue(ctx, t, k * 0.4), 0.5, 0.75, 1, 5)
+			Kit.pulse(pl, C, nrm, u, d * 1.02, d * 1.95, 0.5, k)
+		end
+		if t > MEET and not closing then
+			local want = math.floor((t - MEET) / 0.035)
+			if want > nMote then
+				nMote = want
+				for q = 1, 2 do
+					local a = rng:NextNumber(0, math.pi * 2)
+					local p = point(a, 0.96)
+					local e = if q == 1 then motes else moteStreak
+					e.Color = ColorSequence.new(Kit.col(Kit.hue(ctx, t, a / 6.28), 0.8, 1), Kit.hot(h))
+					ctx.host.CFrame = Kit.upTo(p, (C - p) + tangent(a) * R * 0.5)
+					e:Emit(1)
+				end
+			end
+		end
+		local slot = math.floor(t / 0.06)
+		for i, b in bolts do
+			local r = Random.new(seed * 131 + i * 977 + slot * 31)
+			if t > MEET and not closing and r:NextNumber() < 0.34 then
+				local a = r:NextNumber(-1.5, 1.5)
+				local from = point(a, 1)
+				local to = if G
+					then G + right * r:NextNumber(-1.4, 1.4) * R + nrm * r:NextNumber(-0.7, 0.7) * R
+					else from + radial(a) * r:NextNumber(0.6, 1.3) * R
+				local sd = seed * 53 + i * 101 + slot
+				b.glow.set(from, to, 2.4 * S, 0.1, sd, Kit.col(Kit.hue(ctx, t, i / 3), 0.9, 1), 0.3)
+				b.core.set(from, to, 0.8 * S, 0.1, sd, Color3.new(0, 0, 0), 0)
+			else
+				b.glow.hide()
+				b.core.hide()
+			end
+		end
+		if G then
+			local on = Kit.ramp(t, MEET, OPEN + 0.1) * (if closing then 1 - Kit.ramp(tc, 0, 0.2) else 1)
+			groundGlow.beam.Color = Kit.hueSeq(h, if ctx.opts.rainbow then 0.8 else 0.08, 0.85, 1, 6)
+			groundGlow.set(G, Vector3.yAxis, R * 3.6, 1 - 0.5 * on * flick, t * 0.7)
+			groundRipple.beam.Color = Kit.seq(ctx, h + 0.3, 0.5, 0.7, 1, 5)
+			Kit.pulse(groundRipple, G, Vector3.yAxis, if on > 0.5 then ((t - OPEN) % 0.9) / 0.9 else 0, R * 0.6, R * 4.4, 0.4, t)
+		end
+
+		-- close: the line snaps to a point and pops ----------------------------------------------------------------
+		if closing and once("pop", t, closeAt + 0.22) then
+			Kit.spray(ctx, glints, C, 26, ColorSequence.new(Kit.hot(h), Kit.col(h + 0.3)), "sphere", 1)
+			Kit.spray(ctx, sparks, C, 30, ColorSequence.new(Kit.hot(h), Kit.col(h + 0.6, 0.9, 1)), "sphere", 1)
+		end
+		local pk = if closing and tc >= 0.2 then 1 - Kit.ramp(tc, 0.22, CLOSE) else 0
+		popStar.beam.Color = ColorSequence.new(Color3.new(1, 1, 1))
+		popStar.set(C, 30 * S * pk, if pk > 0 then 0 else 1, 0, 1)
+		popLine.beam.Color = ColorSequence.new(Kit.hot(h + 0.3))
+		popLine.set(C, 12 * S * pk, if pk > 0 then 0 else 1, math.pi / 2, 6)
+
+		light.Color = Kit.col(h, 0.5, 1)
+		light.Brightness = (2.6 * math.max(inside, 0.3 * hd / math.pi) * flick + 7 * mf + 6 * pk) * (1 - rimFade * (1 - pk))
+	end
+end
+
+-- a thump when the rim closes its circle
+function RiftGate.shake(t: number): Vector3
+	if t < MEET or t > MEET + 0.5 then
+		return Vector3.zero
+	end
+	local k = 0.4 * math.exp(-(t - MEET) * 9)
+	return Vector3.new(math.sin(t * 79) * k, math.cos(t * 101) * k, 0)
+end
+
+return RiftGate
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="19">
           <Properties>
             <string name="Name">StormLance</string>
             <string name="Source"><![CDATA[--!strict
@@ -3677,8 +5631,547 @@ return StormLance
 ]]></string>
           </Properties>
         </Item>
+        <Item class="ModuleScript" referent="20">
+          <Properties>
+            <string name="Name">WardShell</string>
+            <string name="Source"><![CDATA[--!strict
+--[[ WardShell: a guard bubble that takes two hits and then bursts.
+	cf = the caster's root CFrame. With opts.caster the shell follows that character's root every frame (like
+	ChargeAura); without one it stays at cf. It never poses, hides or anchors the caster.
+
+	0.00-0.30  snaps open: a lattice of light draws itself up round the body, the shell pops out past full size and
+	           settles, a ring burns where it meets the ground
+	0.30-3.00  hold: a glowing-edged shell (ForceField ball) inside a slowly turning geometric lattice, light running
+	           down its edges, its corners glinting
+	1.00       first hit: something streaks in and stars against the shell; rings wrap round it from the hit point,
+	           the lattice flares, black lightning crawls over the surface, cracks start
+	1.80       second hit from another side, harder: the cracks spread and keep creeping
+	3.00-3.40  shatter: the shell swells and bursts, the lattice flies apart edge by edge, glass shards tumble out
+	handle.stop() plays the shatter from wherever it is; a second stop() removes it at once. ]]
+local Workspace = game:GetService("Workspace")
+local Kit = require(script.Parent.Parent.Kit)
+
+local OPEN = 0.3
+local BREAK = 3.0
+local SHATTER = 0.4
+local HITS = { 1.0, 1.8 }
+local UP = Vector3.yAxis
+local PHI = (1 + math.sqrt(5)) / 2
+
+local WardShell = {
+	life = BREAK + SHATTER,
+	required = { "glow_soft", "spark_streak", "spark_glint", "shock_ring", "ground_disc", "bolt_glow", "smoke_puff", "ice_shard" },
+}
+
+type Edge = { i: number, j: number, a0: Attachment, a1: Attachment, body: Beam, core: Beam, axis: Vector3, spin: number,
+	delay: number, tint: number, fly: number }
+type CrackSeg = { d0: Vector3, d1: Vector3, a0: Attachment, a1: Attachment, glow: Beam, core: Beam, at: number, w: number }
+type Shard = { part: BasePart, dir: Vector3, speed: number, spin: Vector3, base: Vector3, tint: number }
+
+function WardShell.build(ctx: Kit.Ctx): (number) -> ()
+	local S = ctx.opts.scale
+	local rng = ctx.rng
+	local seed = ctx.opts.seed
+	local life = WardShell.life
+	ctx.outro = SHATTER
+	local caster = ctx.opts.caster
+	local hrp = caster and caster:FindFirstChild("HumanoidRootPart")
+	local rootPart: BasePart? = if hrp and hrp:IsA("BasePart") then hrp else nil
+	local R = 8.5 * S
+
+	local start = if rootPart then rootPart.Position else ctx.cf.Position
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = if caster then { ctx.root, caster } :: { Instance } else { ctx.root } :: { Instance }
+	local hit = Workspace:Raycast(start, Vector3.new(0, -14 * S, 0), params)
+	local groundY = if hit then hit.Position.Y + 0.08 else start.Y - 3 * S
+
+	-- where the two hits land (fixed in the world: front and high, then from the side)
+	local look, rightV = ctx.cf.LookVector, ctx.cf.RightVector
+	local hitDir = { (look * 0.8 + UP * 0.5 + rightV * 0.3).Unit, (-rightV * 0.85 + UP * 0.28 + look * 0.4).Unit }
+
+	-- the shell --------------------------------------------------------------------------------------------------
+	local shell = Kit.part(ctx, ctx.root, "Shell", Vector3.one, Color3.new(1, 1, 1), Enum.Material.ForceField)
+	shell.Shape = Enum.PartType.Ball
+	local shell2 = Kit.part(ctx, ctx.root, "ShellInner", Vector3.one, Color3.new(1, 1, 1), Enum.Material.ForceField)
+	shell2.Shape = Enum.PartType.Ball
+	local fill = Kit.part(ctx, ctx.root, "ShellFill", Vector3.one, Color3.new(1, 1, 1), Enum.Material.Neon)
+	fill.Shape = Enum.PartType.Ball
+	fill.Transparency = 1
+
+	-- the lattice: an icosahedron whose edges are bent to lie on the sphere -----------------------------------------
+	local verts: { Vector3 } = {}
+	for _, s1 in { -1, 1 } do
+		for _, s2 in { -1, 1 } do
+			table.insert(verts, Vector3.new(0, s1, s2 * PHI).Unit)
+			table.insert(verts, Vector3.new(s1, s2 * PHI, 0).Unit)
+			table.insert(verts, Vector3.new(s1 * PHI, 0, s2).Unit)
+		end
+	end
+	local edges: { Edge } = {}
+	for i = 1, #verts do
+		for j = i + 1, #verts do
+			if (verts[i] - verts[j]).Magnitude < 1.1 then
+				local a0, a1 = Kit.att(ctx), Kit.att(ctx)
+				local body = Kit.beam(ctx, a0, a1, "bolt_glow", 0)
+				body.Name = "Lattice"
+				body.Segments = 6
+				body.Enabled = false
+				local core = Kit.beam(ctx, a0, a1, "bolt_glow", 1)
+				core.Name = "LatticeCore"
+				core.Segments = 6
+				core.Brightness = 2
+				core.Enabled = false
+				local ax = Vector3.new(rng:NextNumber(-1, 1), rng:NextNumber(-1, 1), rng:NextNumber(-1, 1))
+				table.insert(edges, { i = i, j = j, a0 = a0, a1 = a1, body = body, core = core,
+					axis = if ax.Magnitude > 0.01 then ax.Unit else UP, spin = rng:NextNumber(-11, 11),
+					delay = (1 + math.min(verts[i].Y, verts[j].Y)) / 2 * 0.14, tint = #edges / 30, fly = rng:NextNumber(1.7, 3.1) })
+			end
+		end
+	end
+	local vertGlints = {}
+	for i = 1, #verts do
+		vertGlints[i] = Kit.sprite(ctx, "Corner", "spark_glint", 2)
+	end
+
+	-- cracks: jagged lines walked over the sphere from each hit point; they keep creeping until the shell breaks
+	local cracks: { CrackSeg } = {}
+	for k, n in hitDir do
+		local nC = if k == 1 then 3 else 6
+		local nS = if k == 1 then 4 else 7
+		local bu = n:Cross(UP).Unit
+		local bv = n:Cross(bu)
+		for c = 1, nC do
+			local a = (c - 1) / nC * math.pi * 2 + rng:NextNumber(-0.4, 0.4)
+			local d = n
+			local tan = bu * math.cos(a) + bv * math.sin(a)
+			for s = 1, nS do
+				local st = rng:NextNumber(0.15, 0.27)
+				local nd = (d * math.cos(st) + tan * math.sin(st)).Unit
+				local ntan = (tan * math.cos(st) - d * math.sin(st)).Unit
+				ntan = (ntan + nd:Cross(ntan) * rng:NextNumber(-0.8, 0.8)).Unit
+				local a0, a1 = Kit.att(ctx), Kit.att(ctx)
+				local glow = Kit.beam(ctx, a0, a1, "bolt_glow", 2)
+				glow.Name = "CrackGlow"
+				glow.Segments = 1
+				glow.Enabled = false
+				local core = Kit.beam(ctx, a0, a1, "bolt_glow", 3)
+				core.Name = "Crack"
+				core.Segments = 1
+				core.Brightness = 3
+				core.Enabled = false
+				table.insert(cracks, { d0 = d, d1 = nd, a0 = a0, a1 = a1, glow = glow, core = core,
+					at = HITS[k] + (if s <= 3 then 0.03 * s else 0.09 + (s - 3) * (if k == 1 then 0.5 else 0.22) + rng:NextNumber(-0.05, 0.05)),
+					w = 1 - 0.6 * (s - 1) / nS })
+				d, tan = nd, ntan
+			end
+		end
+	end
+
+	-- hits ---------------------------------------------------------------------------------------------------------
+	local cA0, cA1 = Kit.att(ctx), Kit.att(ctx)
+	local cometInk = Kit.beam(ctx, cA0, cA1, "bolt_glow", -1)
+	cometInk.Name = "ShotInk"
+	cometInk.LightEmission = 0
+	local comet = Kit.beam(ctx, cA0, cA1, "bolt_glow", 1)
+	comet.Name = "Shot"
+	local cometCore = Kit.beam(ctx, cA0, cA1, "bolt_glow", 2)
+	cometCore.Name = "ShotCore"
+	for _, b in { cometInk, comet, cometCore } do
+		b.Segments = 1
+		b.Width1 = 0
+		b.Enabled = false
+	end
+	local cometHead = Kit.sprite(ctx, "ShotHead", "glow_soft", 3)
+	local hitFlash = Kit.sprite(ctx, "HitFlash", "glow_soft", 5)
+	local hitStar = Kit.sprite(ctx, "HitStar", "spark_glint", 6)
+	local hitStar2 = Kit.sprite(ctx, "HitStar2", "spark_glint", 6)
+	local wraps = { Kit.plate(ctx, "Ripple", "shock_ring", 2), Kit.plate(ctx, "Ripple", "shock_ring", 2), Kit.plate(ctx, "Ripple", "shock_ring", 2) }
+	local wrapInk = Kit.plate(ctx, "RippleInk", "shock_ring", 1)
+	wrapInk.beam.LightEmission = 0
+	local bolts = {}
+	for i = 1, 5 do
+		bolts[i] = { glow = Kit.bolt(ctx, "HakiGlow", 5, 3, 1), core = Kit.bolt(ctx, "HakiCore", 5, 4, 0) }
+	end
+
+	-- open / shatter -----------------------------------------------------------------------------------------------
+	local openFlash = Kit.sprite(ctx, "OpenFlash", "glow_soft", 4)
+	local openStar = Kit.sprite(ctx, "OpenStar", "spark_glint", 5)
+	local groundRing = Kit.plate(ctx, "GroundRing", "shock_ring", 0.6)
+	local groundGlow = Kit.plate(ctx, "GroundGlow", "ground_disc", 0.2)
+	local openShock = Kit.flat(ctx, "OpenShock", { tex = "shock_ring", life = 0.4, size = { { 0, 4 }, { 0.3, 28 }, { 1, 44 } },
+		transp = { { 0, 0.05 }, { 0.5, 0.35 }, { 1, 1 } }, bright = 2, z = 1 })
+	local breakShock = Kit.flat(ctx, "BreakShock", { tex = "shock_ring", life = 0.4, size = { { 0, 12 }, { 0.3, 44 }, { 1, 70 } },
+		transp = { { 0, 0 }, { 0.5, 0.3 }, { 1, 1 } }, bright = 2.5, z = 1 })
+	local breakInk = Kit.flat(ctx, "BreakInk", { tex = "shock_ring", life = 0.4, size = { { 0, 14 }, { 0.3, 50 }, { 1, 78 } },
+		transp = { { 0, 0.1 }, { 0.6, 0.45 }, { 1, 1 } }, le = 0, z = 0.5 })
+	local breakRing = Kit.sprite(ctx, "BreakRing", "shock_ring", 4)
+	local breakFlash = Kit.sprite(ctx, "BreakFlash", "glow_soft", 6)
+	local breakStar = Kit.sprite(ctx, "BreakStar", "spark_glint", 7)
+	local shards: { Shard } = {}
+	for i = 1, 22 do
+		local base = Vector3.new(0.22, rng:NextNumber(2.2, 5), rng:NextNumber(1.3, 3.2)) * S
+		local p = Kit.wedge(ctx.root, "GlassShard", base, Color3.new(1, 1, 1), Enum.Material.Neon)
+		local dv = Vector3.new(rng:NextNumber(-1, 1), rng:NextNumber(-0.35, 1), rng:NextNumber(-1, 1))
+		shards[i] = { part = p, dir = if dv.Magnitude > 0.01 then dv.Unit else UP, speed = rng:NextNumber(38, 80) * S,
+			spin = Vector3.new(rng:NextNumber(-12, 12), rng:NextNumber(-12, 12), rng:NextNumber(-12, 12)), base = base, tint = rng:NextNumber() }
+	end
+
+	local sparks = Kit.burst(ctx, "Sparks", { tex = "spark_streak", life = { 0.25, 0.55 }, size = { { 0, 0.4 }, { 0.2, 2.1 }, { 1, 0.2 } },
+		transp = { { 0, 0 }, { 0.6, 0.15 }, { 1, 1 } }, speed = { 40, 95 }, spread = 55, drag = 2.6, acc = Vector3.new(0, -60 * S, 0),
+		rot = { 90 }, vpar = true, bright = 2.5 })
+	local glints = Kit.burst(ctx, "Glints", { tex = "spark_glint", life = { 0.25, 0.55 }, size = { { 0, 0 }, { 0.2, 1.7 }, { 1, 0 } },
+		speed = { 12, 38 }, drag = 3.5, rot = { 0, 360 }, rotSpeed = { -160, 160 }, bright = 3 })
+	local chips = Kit.burst(ctx, "Chips", { tex = "ice_shard", life = { 0.35, 0.6 }, size = { { 0, 1.5 }, { 0.6, 1.2 }, { 1, 0 } },
+		transp = { { 0, 0.05 }, { 0.7, 0.3 }, { 1, 1 } }, speed = { 40, 90 }, spread = 14, drag = 2.2, acc = Vector3.new(0, -50 * S, 0),
+		rot = { 0, 360 }, rotSpeed = { -500, 500 }, bright = 2 })
+	local lines = Kit.burst(ctx, "BurstLines", { tex = "spark_streak", life = { 0.12, 0.2 }, size = { { 0, 0.7 }, { 0.3, 5 }, { 1, 0.5 } },
+		transp = { { 0, 0.1 }, { 0.6, 0.3 }, { 1, 1 } }, speed = { 120, 180 }, spread = 4, rot = { 90 }, vpar = true, bright = 2 })
+	local dust = Kit.burst(ctx, "Dust", { tex = "smoke_puff", life = { 0.4, 0.7 }, size = { { 0, 1.6 }, { 1, 6 } },
+		transp = { { 0, 0.4 }, { 0.5, 0.68 }, { 1, 1 } }, speed = { 26, 52 }, drag = 4, rot = { 0, 360 }, rotSpeed = { -70, 70 }, le = 0 })
+	local motes = Kit.burst(ctx, "Motes", { tex = "spark_glint", life = { 0.5, 0.9 }, size = { { 0, 0 }, { 0.2, 0.7 }, { 1, 0 } },
+		speed = { 2, 6 }, spread = 20, rot = { 0, 360 }, rotSpeed = { -120, 120 }, bright = 2.5 })
+
+	local grade = Kit.grade(ctx)
+	local lightPart = Kit.part(ctx, ctx.root, "Light", Vector3.one * 0.2, Color3.new(), Enum.Material.SmoothPlastic)
+	lightPart.Transparency = 1
+	local light = Kit.light(ctx, lightPart, 30 * S)
+
+	local once = Kit.once()
+	local nMote = 0
+	local W: { Vector3 } = table.create(#verts, Vector3.zero)
+	local centre = start
+
+	local function sprayShell(e: ParticleEmitter, n: number, color: ColorSequence, rad: number)
+		e.Color = color
+		for _ = 1, n do
+			local dv = Vector3.new(rng:NextNumber(-1, 1), rng:NextNumber(-1, 1), rng:NextNumber(-1, 1))
+			local d = if dv.Magnitude > 0.01 then dv.Unit else UP
+			ctx.host.CFrame = Kit.upTo(centre + d * rad, d)
+			e:Emit(1)
+		end
+	end
+
+	return function(t: number)
+		local h = Kit.hue(ctx, t, 0)
+		local breakAt = ctx.stopAt or (life - SHATTER)
+		local ts = t - breakAt
+		local broken = ts >= 0
+		if rootPart and rootPart.Parent then
+			centre = rootPart.Position
+		end
+		local Cc = centre
+
+		-- which hit is ringing (only hits that land before the shell breaks) ------------------------------------------
+		local hk, th = 0, -10
+		for k, at in HITS do
+			if t >= at and at < breakAt then
+				hk, th = k, t - at
+			end
+		end
+		local hn = if hk > 0 then hitDir[hk] else UP
+		local punch = if hk > 0 then math.exp(-th * 9) else 0 -- 1 at the moment of a hit
+		local power = if hk == 2 then 1.35 else 1
+
+		-- shell ------------------------------------------------------------------------------------------------------
+		local grow = Kit.easeOutBack(Kit.ramp(t, 0, OPEN))
+		local bulge = 1 + 0.07 * power * punch * math.cos(th * 38)
+		local swell = if broken then 1 + 0.55 * Kit.easeOut(Kit.ramp(ts, 0, 0.2)) else 1
+		local Rs = R * grow * bulge
+		local flick = 0.8 + 0.2 * Kit.slotRng(seed, t, 1 / 30):NextNumber()
+		local gone = if broken then Kit.ramp(ts, 0, 0.16) else 0
+		if gone < 1 and grow > 0.02 then
+			local dsz = 2 * Rs * swell
+			shell.Size = Vector3.one * dsz
+			shell.CFrame = CFrame.new(Cc) * CFrame.Angles(0, t * 0.8, 0)
+			shell.Color = Kit.col(h, 0.75 - 0.6 * punch, 1)
+			shell.Transparency = math.clamp(0.12 + 0.2 * (1 - flick) + gone, 0, 1)
+			shell2.Size = Vector3.one * dsz * 0.955
+			shell2.CFrame = CFrame.new(Cc) * CFrame.Angles(0.5, -t * 1.1, 0.3)
+			shell2.Color = Kit.col(h + 0.35, 0.8 - 0.6 * punch, 1)
+			shell2.Transparency = math.clamp(0.3 + gone, 0, 1)
+			fill.Size = Vector3.one * dsz * 0.985
+			fill.CFrame = CFrame.new(Cc)
+			fill.Color = Kit.col(h + 0.1, 0.5 - 0.4 * punch, 1)
+			fill.Transparency = math.clamp(0.94 - 0.4 * punch * power - 0.5 * (1 - Kit.ramp(t, 0, 0.2)) + (if broken then -0.5 * (1 - gone) + gone else 0), 0.3, 1)
+		else
+			shell.CFrame, shell2.CFrame, fill.CFrame = Kit.HIDE, Kit.HIDE, Kit.HIDE
+		end
+
+		-- lattice ----------------------------------------------------------------------------------------------------
+		local rot = CFrame.Angles(0, t * 0.45, 0) * CFrame.Angles(0.32, 0, 0.2)
+		for i, v in verts do
+			W[i] = rot:VectorToWorldSpace(v)
+		end
+		local wave = 1.7 * Kit.easeOut(Kit.ramp(th, 0, 0.5)) -- angle the hit ripple has reached
+		local waveA = if hk > 0 then 1 - Kit.ramp(th, 0.2, 0.6) else 0
+		local Rl = Rs * 1.015
+		for _, e in edges do
+			local u0, u1 = W[e.i], W[e.j]
+			if broken then
+				local u = ts / SHATTER
+				if u >= 1 then
+					e.body.Enabled, e.core.Enabled = false, false
+					continue
+				end
+				local m = (u0 + u1).Unit
+				local c = Cc + m * (R + R * e.fly * Kit.easeOut(u)) - UP * 22 * S * ts * ts
+				local hv = CFrame.fromAxisAngle(e.axis, e.spin * ts):VectorToWorldSpace((u1 - u0) * R * 0.5)
+				e.a0.CFrame = CFrame.new(c - hv)
+				e.a1.CFrame = CFrame.new(c + hv)
+				e.body.CurveSize0, e.body.CurveSize1, e.core.CurveSize0, e.core.CurveSize1 = 0, 0, 0, 0
+				local he = Kit.hue(ctx, t, e.tint)
+				e.body.Width0, e.body.Width1 = 1.1 * S, 1.1 * S
+				e.body.Color = ColorSequence.new(Kit.col(he, 0.7, 1))
+				e.body.Transparency = NumberSequence.new(math.clamp(0.1 + 0.9 * u * u, 0, 1))
+				e.core.Width0, e.core.Width1 = 0.4 * S, 0.4 * S
+				e.core.Color = ColorSequence.new(Color3.new(1, 1, 1))
+				e.core.Transparency = NumberSequence.new(math.clamp(u * u, 0, 1))
+				e.body.Enabled, e.core.Enabled = true, true
+				continue
+			end
+			local f = Kit.easeOut(Kit.ramp(t, e.delay, e.delay + 0.14))
+			if f < 0.04 then
+				e.body.Enabled, e.core.Enabled = false, false
+				continue
+			end
+			local ue = if f < 1 then u0:Lerp(u1, f).Unit else u1
+			local cosT = math.clamp(u0:Dot(ue), -1, 1)
+			local theta = math.acos(cosT)
+			local hl = 4 / 3 * math.tan(theta / 4) * Rl
+			e.a0.CFrame = Kit.rightTo(Cc + u0 * Rl, ue - u0 * cosT)
+			e.a1.CFrame = Kit.rightTo(Cc + ue * Rl, ue * cosT - u0)
+			e.body.CurveSize0, e.body.CurveSize1, e.core.CurveSize0, e.core.CurveSize1 = hl, hl, hl, hl
+			local m = (u0 + u1).Unit
+			local flare = 0
+			if waveA > 0 then
+				local ang = math.acos(math.clamp(m:Dot(hn), -1, 1))
+				flare = math.exp(-((ang - wave) / 0.42) ^ 2) * waveA * power
+			end
+			local sh = 0.5 + 0.5 * math.sin(t * 5 - m.Y * 4 + e.tint * 3) -- light running down the lattice
+			local he = Kit.hue(ctx, t, e.tint)
+			local wd = (0.55 + 0.4 * sh + 1.5 * flare + 1.2 * (1 - Kit.ramp(t, e.delay, e.delay + 0.3))) * S
+			e.body.Width0, e.body.Width1 = wd, wd
+			e.body.Color = ColorSequence.new(Kit.col(he, 0.85 - 0.7 * math.min(flare, 1), 1), Kit.col(he + 0.12, 0.85 - 0.7 * math.min(flare, 1), 1))
+			e.body.Transparency = NumberSequence.new(math.clamp(0.35 - 0.2 * sh - 0.3 * flare, 0, 1))
+			e.core.Width0, e.core.Width1 = wd * 0.3, wd * 0.3
+			e.core.Color = ColorSequence.new(Color3.new(1, 1, 1))
+			e.core.Transparency = NumberSequence.new(math.clamp(0.45 - 0.35 * sh - 0.4 * flare, 0, 1))
+			e.body.Enabled, e.core.Enabled = true, true
+		end
+		for i, sp in vertGlints do
+			if broken or t < 0.14 then
+				sp.hide()
+			else
+				local tw = 0.5 + 0.5 * math.sin(t * 6.3 + i * 1.9)
+				sp.beam.Color = ColorSequence.new(Kit.hot(Kit.hue(ctx, t, i / 12)))
+				sp.set(Cc + W[i] * Rl, (1.6 + 2.6 * tw * tw + 4 * punch) * S, 0.15, t * 1.5 + i)
+			end
+		end
+
+		-- cracks -------------------------------------------------------------------------------------------------------
+		for _, c in cracks do
+			if broken or t < c.at or c.at >= breakAt then
+				c.glow.Enabled, c.core.Enabled = false, false
+				continue
+			end
+			local pop = 1 + 2.4 * math.exp(-(t - c.at) * 12) -- each new piece of crack flashes as it opens
+			c.a0.CFrame = CFrame.new(Cc + c.d0 * Rl * 1.004)
+			c.a1.CFrame = CFrame.new(Cc + c.d1 * Rl * 1.004)
+			c.glow.Width0, c.glow.Width1 = 1.5 * c.w * pop * S, 1.3 * c.w * pop * S
+			c.glow.Color = ColorSequence.new(Kit.col(h + 0.5, 0.7, 1))
+			c.glow.Transparency = NumberSequence.new(0.45)
+			c.core.Width0, c.core.Width1 = 0.5 * c.w * pop * S, 0.42 * c.w * pop * S
+			c.core.Color = ColorSequence.new(Color3.new(1, 1, 1))
+			c.core.Transparency = NumberSequence.new(0.05 + 0.2 * (1 - flick))
+			c.glow.Enabled, c.core.Enabled = true, true
+		end
+
+		-- open ---------------------------------------------------------------------------------------------------------
+		local G = Vector3.new(Cc.X, groundY, Cc.Z)
+		if once("open", t, 0) then
+			openShock.fire(0.05, G, Kit.seq(ctx, h, 0.6, 0.6, 1, 5))
+			Kit.spray(ctx, dust, G + UP * 0.8 * S, 18, ColorSequence.new(Color3.fromHSV(h, 0.14, 0.6)), "disc", 2, 0.08)
+		end
+		if once("openPop", t, OPEN * 0.55) then
+			sprayShell(glints, 26, ColorSequence.new(Kit.hot(h), Kit.col(h + 0.2)), R)
+		end
+		openShock.update(t)
+		local of = 1 - Kit.ramp(t, 0, 0.2)
+		openFlash.beam.Color = ColorSequence.new(Kit.hot(h))
+		openFlash.set(Cc, (10 + 2.6 * R / S * Kit.easeOut(Kit.ramp(t, 0, 0.2))) * S, 1 - 0.8 * of)
+		openStar.beam.Color = ColorSequence.new(Color3.new(1, 1, 1))
+		openStar.set(Cc, 30 * S * of, if of > 0 then 0.1 else 1, 0.4, 1)
+		local depth = Cc.Y - groundY
+		local rg = math.sqrt(math.max(Rs * Rs - depth * depth, 0))
+		if rg > 0.5 * S and not broken then
+			groundRing.beam.Color = Kit.seq(ctx, h, 0.8, 0.7, 1, 6)
+			groundRing.set(G, UP, 2 * rg / 0.86, 0.15 + 0.15 * (1 - flick), t * 1.3)
+			groundGlow.beam.Color = Kit.hueSeq(h + 0.2, if ctx.opts.rainbow then 0.6 else 0.08, 0.8, 1, 5)
+			groundGlow.set(G, UP, rg * 2.9, 0.55 - 0.25 * punch, -t * 0.6)
+		else
+			groundRing.hide()
+			groundGlow.hide()
+		end
+		if not broken and t > OPEN then
+			local want = math.floor(t / 0.07)
+			if want > nMote then
+				nMote = want
+				sprayShell(motes, 1, ColorSequence.new(Kit.col(Kit.hue(ctx, t, rng:NextNumber()), 0.7, 1), Kit.hot(h)), Rs)
+			end
+		end
+
+		-- hits ---------------------------------------------------------------------------------------------------------
+		local shot = false
+		for k, at in HITS do
+			if at >= breakAt then
+				continue
+			end
+			local n = hitDir[k]
+			local P = Cc + n * Rs
+			if t >= at - 0.12 and t < at then
+				shot = true
+				local u = (t - (at - 0.12)) / 0.12
+				local head = P + n * 46 * S * (1 - u)
+				cA0.CFrame = CFrame.new(head)
+				cA1.CFrame = CFrame.new(head + n * 22 * S)
+				local hc = Kit.hue(ctx, t, k * 0.4)
+				cometInk.Width0 = 4.4 * S
+				cometInk.Color = ColorSequence.new(Kit.ink(hc))
+				cometInk.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.2), NumberSequenceKeypoint.new(1, 1) })
+				comet.Width0 = 2.8 * S
+				comet.Color = Kit.seq(ctx, hc, 0.4, 0.9, 1, 4)
+				comet.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0), NumberSequenceKeypoint.new(1, 1) })
+				cometCore.Width0 = 1.1 * S
+				cometCore.Color = ColorSequence.new(Kit.hot(hc))
+				cometCore.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0), NumberSequenceKeypoint.new(1, 1) })
+				cometHead.beam.Color = ColorSequence.new(Kit.hot(hc))
+				cometHead.set(head, 6 * S, 0.1)
+			end
+			if once("hit" .. k, t, at) then
+				local pw = if k == 2 then 1.4 else 1
+				Kit.spray(ctx, sparks, P, math.floor(38 * pw), ColorSequence.new(Kit.hot(h), Kit.col(h + 0.25, 0.8, 1)), "point", 0, 0, n)
+				Kit.spray(ctx, glints, P + n * S, math.floor(18 * pw), ColorSequence.new(Kit.hot(h), Kit.col(h + 0.15)), "sphere", 2)
+				Kit.spray(ctx, chips, P, math.floor(8 * pw), ColorSequence.new(Kit.hot(h), Kit.col(h + 0.4, 0.5, 1)), "point", 0, 0, n)
+			end
+		end
+		cometInk.Enabled, comet.Enabled, cometCore.Enabled = shot, shot, shot
+		if not shot then
+			cometHead.hide()
+		end
+		if hk > 0 and not broken then
+			local P = Cc + hn * Rs
+			local hf = 1 - Kit.ramp(th, 0, 0.14)
+			hitFlash.beam.Color = ColorSequence.new(Kit.hot(h))
+			hitFlash.set(P, (8 + 22 * hf) * S * power, 1 - hf)
+			hitStar.beam.Color = ColorSequence.new(Color3.new(1, 1, 1))
+			hitStar.set(P, 40 * S * hf * power, if hf > 0 then 0 else 1, 0.4, 1)
+			hitStar2.beam.Color = ColorSequence.new(Kit.hot(h + 0.3))
+			hitStar2.set(P, 25 * S * hf * power, if hf > 0 then 0.1 else 1, 0.4 + math.pi / 4 + th * 6, 1)
+			-- rings wrapping round the shell from the hit point
+			for i, pl in wraps do
+				local u = Kit.ramp(th, (i - 1) * 0.07, 0.42 + (i - 1) * 0.09)
+				local ang = 0.12 + 1.65 * Kit.easeOut(u)
+				pl.beam.Color = Kit.seq(ctx, Kit.hue(ctx, t, i * 0.25), 0.6, 0.7, 1, 5)
+				pl.set(Cc + hn * Rs * 1.03 * math.cos(ang), hn, 2 * Rs * 1.03 * math.sin(ang) / 0.86, if u <= 0 or u >= 1 then 1 else 0.05 + 0.95 * u * u, i * 2.1)
+			end
+			local iu = Kit.ramp(th, 0.02, 0.5)
+			local iang = 0.12 + 1.65 * Kit.easeOut(iu)
+			wrapInk.beam.Color = ColorSequence.new(Kit.ink(h))
+			wrapInk.set(Cc + hn * Rs * 1.04 * math.cos(iang), hn, 2 * Rs * 1.1 * math.sin(iang) / 0.86, if iu <= 0 or iu >= 1 then 1 else 0.2 + 0.8 * iu * iu, 1)
+		else
+			hitFlash.hide()
+			hitStar.hide()
+			hitStar2.hide()
+			for _, pl in wraps do
+				pl.hide()
+			end
+			wrapInk.hide()
+		end
+		-- black lightning crawling over the surface from the hit point
+		local slot = math.floor(t / 0.05)
+		local crawl = if hk > 0 and not broken then 1 - Kit.ramp(th, 0.05, 0.42) else 0
+		for i, b in bolts do
+			local r = Random.new(seed * 131 + i * 977 + slot * 31)
+			if crawl > 0 and r:NextNumber() < 0.35 + 0.6 * crawl then
+				local bu = hn:Cross(UP).Unit
+				local bv = hn:Cross(bu)
+				local a = r:NextNumber(0, math.pi * 2)
+				local reach = r:NextNumber(0.55, 1.25) * power
+				local q = (hn * math.cos(reach) + (bu * math.cos(a) + bv * math.sin(a)) * math.sin(reach)).Unit
+				local sd = seed * 53 + i * 101 + slot
+				b.glow.set(Cc + hn * Rs * 1.05, Cc + q * Rs * 1.08, 2.2 * S, 0.12, sd, Kit.col(Kit.hue(ctx, t, i / #bolts), 0.9, 1), 0.3)
+				b.core.set(Cc + hn * Rs * 1.05, Cc + q * Rs * 1.08, 0.75 * S, 0.12, sd, Color3.new(0, 0, 0), 0)
+			else
+				b.glow.hide()
+				b.core.hide()
+			end
+		end
+
+		-- shatter ------------------------------------------------------------------------------------------------------
+		if broken and once("break", t, breakAt) then
+			breakShock.fire(breakAt, G, Kit.seq(ctx, h, 0.7, 0.55, 1, 6))
+			breakInk.fire(breakAt, G, ColorSequence.new(Kit.ink(h)))
+			sprayShell(chips, 70, ColorSequence.new(Kit.hot(h), Kit.col(h + 0.3, 0.6, 1)), R)
+			sprayShell(glints, 44, ColorSequence.new(Kit.hot(h), Kit.col(h + 0.15)), R)
+			sprayShell(sparks, 50, ColorSequence.new(Kit.hot(h), Kit.col(h + 0.5, 0.8, 1)), R)
+			sprayShell(lines, 36, ColorSequence.new(Kit.hot(h), Kit.col(h + 0.4, 0.7, 1)), R * 0.9)
+			Kit.spray(ctx, dust, G + UP * S, 26, ColorSequence.new(Color3.fromHSV(h, 0.14, 0.6)), "disc", 6, 0.08)
+		end
+		breakShock.update(t)
+		breakInk.update(t)
+		local bf = if broken then 1 - Kit.ramp(ts, 0, 0.15) else 0
+		breakFlash.beam.Color = ColorSequence.new(Kit.hot(h))
+		breakFlash.set(Cc, (2.4 * R / S + 34 * bf) * S, 1 - bf)
+		breakStar.beam.Color = ColorSequence.new(Color3.new(1, 1, 1))
+		breakStar.set(Cc, 64 * S * bf, if bf > 0 then 0 else 1, 0.5, 1)
+		local bu = if broken then Kit.ramp(ts, 0, 0.34) else 0
+		breakRing.beam.Color = Kit.seq(ctx, h, 0.8, 0.6, 1, 6)
+		breakRing.set(Cc, 2 * R * (1.1 + 2.4 * Kit.easeOut(bu)), if bu <= 0 or bu >= 1 then 1 else 0.05 + 0.95 * bu * bu)
+		for _, sd in shards do
+			if not broken or ts >= SHATTER then
+				sd.part.CFrame = Kit.HIDE
+				continue
+			end
+			local travel = sd.speed * (1 - math.exp(-3.2 * ts)) / 3.2
+			local pos = Cc + sd.dir * (R + travel) - UP * 30 * S * ts * ts
+			sd.part.Size = sd.base * (1 - 0.5 * Kit.ramp(ts, 0.15, SHATTER))
+			sd.part.CFrame = CFrame.new(pos) * CFrame.Angles(sd.spin.X * ts, sd.spin.Y * ts, sd.spin.Z * ts)
+			sd.part.Color = Kit.col(Kit.hue(ctx, t, sd.tint), 0.45, 1)
+			sd.part.Transparency = 0.15 + 0.85 * Kit.easeIn(Kit.ramp(ts, 0.12, SHATTER - 0.02))
+		end
+
+		if grade then
+			local k = (if broken then math.exp(-ts * 14) else 0) + 0.5 * punch * power * (if hk > 0 and not broken then 1 else 0)
+			grade.Brightness = 0.22 * k
+			grade.Contrast = 0.25 * k
+			grade.Saturation = 0.2 * k
+		end
+		lightPart.CFrame = CFrame.new(Cc)
+		light.Color = Kit.col(h, 0.45, 1)
+		light.Brightness = if broken then 9 * math.exp(-ts * 9) else (1.6 * grow * flick + 5 * punch * power + 4 * of)
+	end
+end
+
+-- a knock for each hit, a harder one when it bursts
+function WardShell.shake(t: number): Vector3
+	local k = 0
+	if t >= BREAK then
+		k = 0.7 * math.exp(-(t - BREAK) * 9)
+	elseif t >= HITS[2] then
+		k = 0.5 * math.exp(-(t - HITS[2]) * 11)
+	elseif t >= HITS[1] then
+		k = 0.35 * math.exp(-(t - HITS[1]) * 11)
+	end
+	return Vector3.new(math.sin(t * 87) * k, math.cos(t * 109) * k, 0)
+end
+
+return WardShell
+]]></string>
+          </Properties>
+        </Item>
       </Item>
-      <Item class="ModuleScript" referent="16">
+      <Item class="ModuleScript" referent="21">
         <Properties>
           <string name="Name">Kit</string>
           <string name="Source"><![CDATA[--!strict
@@ -3689,7 +6182,7 @@ local Kit = {}
 
 Kit.missing = {} :: { [string]: number }
 
-export type Opts = { rainbow: boolean, hue: number, scale: number, caster: Model?, seed: number, grade: boolean? }
+export type Opts = { rainbow: boolean, hue: number, scale: number, caster: Model?, seed: number, grade: boolean?, to: Vector3? }
 export type Ctx = {
 	root: Model,
 	cf: CFrame,
@@ -3700,6 +6193,8 @@ export type Ctx = {
 	cleanups: { () -> () },
 	rig: Part,
 	host: Part,
+	outro: number?, -- set by build: seconds of closing animation handle.stop() should still play (RiftGate, WardShell)
+	stopAt: number?, -- set by handle.stop(): effect time the stop was asked for; the effect closes from here
 }
 
 Kit.HIDE = CFrame.new(0, -5000, 0)
@@ -3788,6 +6283,11 @@ function Kit.hueSeq(h0: number, span: number, s: number?, v: number?, n: number?
 		table.insert(kps, ColorSequenceKeypoint.new(f, Color3.fromHSV((h0 + span * f) % 1, s or 0.9, v or 1)))
 	end
 	return ColorSequence.new(kps)
+end
+
+-- Kit.hueSeq that honours opts.rainbow: the full span in rainbow mode, a narrow run round the hue otherwise
+function Kit.seq(ctx: Ctx, h0: number, span: number, s: number?, v: number?, n: number?): ColorSequence
+	return Kit.hueSeq(h0, if ctx.opts.rainbow then span else span * 0.12, s, v, n)
 end
 
 -- instances --------------------------------------------------------------------------------------------------
@@ -4210,11 +6710,78 @@ function Kit.rightTo(p: Vector3, d: Vector3): CFrame
 	return CFrame.fromMatrix(p, u, r.Unit)
 end
 
+-- jagged lightning between two points: n straight segments whose joints are thrown off the line. set(p0, p1, width,
+-- jag (fraction of the length), seed, colour, transparency); the same seed always draws the same bolt, so a dark
+-- core and its glow can share one path and a frozen frame repeats exactly.
+export type Bolt = { beams: { Beam }, set: (Vector3, Vector3, number, number, number, Color3, number) -> (), hide: () -> () }
+function Kit.bolt(ctx: Ctx, name: string, n: number, z: number?, le: number?): Bolt
+	local atts: { Attachment } = {}
+	local beams: { Beam } = {}
+	for i = 1, n + 1 do
+		atts[i] = Kit.att(ctx)
+	end
+	for i = 1, n do
+		local b = Kit.beam(ctx, atts[i], atts[i + 1], "bolt_glow", z or 0)
+		b.Name = name
+		b.Segments = 1
+		b.LightEmission = le or 1
+		b.Enabled = false
+		beams[i] = b
+	end
+	local function hide()
+		for _, b in beams do
+			b.Enabled = false
+		end
+	end
+	return {
+		beams = beams,
+		set = function(p0: Vector3, p1: Vector3, width: number, jag: number, seed: number, color: Color3, transp: number)
+			local d = p1 - p0
+			local len = d.Magnitude
+			if transp >= 0.995 or width <= 0 or len < 1e-4 then
+				hide()
+				return
+			end
+			local r = Random.new(math.floor(seed))
+			local u = d:Cross(Vector3.yAxis)
+			if u.Magnitude < 1e-3 then
+				u = d:Cross(Vector3.xAxis)
+			end
+			u = u.Unit
+			local v = u:Cross(d.Unit)
+			for i = 1, n + 1 do
+				local k = if i == 1 or i == n + 1 then 0 else jag * len
+				atts[i].CFrame = CFrame.new(p0 + d * ((i - 1) / n) + (u * r:NextNumber(-1, 1) + v * r:NextNumber(-1, 1)) * k)
+			end
+			local cs = ColorSequence.new(color)
+			local ts = NumberSequence.new(math.clamp(transp, 0, 1))
+			for i, b in beams do
+				b.Width0 = width * (1 - 0.7 * (i - 1) / n)
+				b.Width1 = width * (1 - 0.7 * i / n)
+				b.Color = cs
+				b.Transparency = ts
+				b.Enabled = true
+			end
+		end,
+		hide = hide,
+	}
+end
+
+-- one expanding ring on a Kit.plate: u = 0..1 through its life, size s0 -> s1 (studs), opacity fading from a0
+function Kit.pulse(pl: Plate, pos: Vector3, normal: Vector3, u: number, s0: number, s1: number, a0: number?, rot: number?)
+	if u <= 0 or u >= 1 then
+		pl.hide()
+		return
+	end
+	local a = a0 or 0
+	pl.set(pos, normal, s0 + (s1 - s0) * Kit.easeOut(u), a + (1 - a) * u * u, rot)
+end
+
 return Kit
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="17">
+      <Item class="ModuleScript" referent="22">
         <Properties>
           <string name="Name">Pose</string>
           <string name="Source"><![CDATA[--!strict
@@ -4340,7 +6907,7 @@ return Pose
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="18">
+      <Item class="ModuleScript" referent="23">
         <Properties>
           <string name="Name">SelfTest</string>
           <string name="Source"><![CDATA[--!strict
@@ -4572,11 +7139,11 @@ return SelfTest
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="19">
+      <Item class="ModuleScript" referent="24">
         <Properties>
           <string name="Name">Sounds</string>
           <string name="Source"><![CDATA[--!strict
--- Optional Set 2 audio. Upload audio/mix/s2_*.mp3 under your experience owner,
+-- Optional Set 2 and Set 3 audio. Upload audio/mix/s2_*.mp3 and s3_*.mp3 under your experience owner,
 -- grant the experience access, then fill these IDs. Blank entries stay silent.
 local Debris = game:GetService("Debris")
 local Sounds = {}
@@ -4586,6 +7153,11 @@ Sounds.IDs = {
 	ChargeBeam = "", -- s2_beam.mp3 (plays after the 0.45 s charge)
 	GhostDash = "", -- s2_dash.mp3
 	ImpactFlash = "", -- s2_impact.mp3
+	QuakeSlam = "", -- s3_quake.mp3
+	BlinkStep = "", -- s3_blink.mp3
+	RiftGate = "", -- s3_gate.mp3 (opening; s3_gate_b.mp3 is a short close)
+	WardShell = "", -- s3_ward.mp3 (opening; s3_wardhit.mp3 and s3_shatter.mp3 are the hits and the burst)
+	Fireball = "", -- s3_fire.mp3 (s3_fire_b.mp3 is the explosion alone)
 }
 
 -- parent: a BasePart or Attachment for spatial sound. The effect handle cancels
@@ -4620,20 +7192,21 @@ return Sounds
       </Item>
     </Item>
   </Item>
-  <Item class="StarterPlayer" referent="20">
+  <Item class="StarterPlayer" referent="25">
     <Properties>
       <string name="Name">StarterPlayer</string>
     </Properties>
-    <Item class="StarterPlayerScripts" referent="21">
+    <Item class="StarterPlayerScripts" referent="26">
       <Properties>
         <string name="Name">StarterPlayerScripts</string>
       </Properties>
-      <Item class="LocalScript" referent="22">
+      <Item class="LocalScript" referent="27">
         <Properties>
           <string name="Name">wakuDemo</string>
           <string name="Source"><![CDATA[--!strict
 -- wakuVFX demo: press 1 PrismCleave, 2 CrystalBloom, 3 StormLance, 4 EarthRise on your own character (gamepad: X/Y/B/A),
--- 5 ChargeAura (press again to drop it), 6 HitBurst, 7 ChargeBeam, 8 GhostDash, 9 ImpactFlash (keyboard only).
+-- 5 ChargeAura (press again to drop it), 6 HitBurst, 7 ChargeBeam, 8 GhostDash, 9 ImpactFlash (keyboard only),
+-- Z QuakeSlam, X BlinkStep, C RiftGate (press again to close it), V WardShell (press again to burst it), B Fireball.
 -- Client-only visuals. For multiplayer, send one RemoteEvent and call waku.play on every client.
 local ContextActionService = game:GetService("ContextActionService")
 local Players = game:GetService("Players")
@@ -4655,9 +7228,15 @@ local BIND = {
 	{ fx = "ChargeBeam", keys = { Enum.KeyCode.Seven }, title = "Beam" },
 	{ fx = "GhostDash", keys = { Enum.KeyCode.Eight }, title = "Dash" },
 	{ fx = "ImpactFlash", keys = { Enum.KeyCode.Nine }, title = "Impact" },
+	{ fx = "QuakeSlam", keys = { Enum.KeyCode.Z }, title = "Quake" },
+	{ fx = "BlinkStep", keys = { Enum.KeyCode.X }, title = "Blink" },
+	{ fx = "RiftGate", keys = { Enum.KeyCode.C }, title = "Gate" },
+	{ fx = "WardShell", keys = { Enum.KeyCode.V }, title = "Ward" },
+	{ fx = "Fireball", keys = { Enum.KeyCode.B }, title = "Fire" },
 }
 local POSED = { PrismCleave = true, StormLance = true, EarthRise = true, ChargeBeam = true } -- one posed clone at a time
 local aura: any = nil
+local held: { [string]: any } = {} -- RiftGate / WardShell: the second press stops the one that is up
 local combo = 0
 local busy: { [string]: boolean } = {}
 
@@ -4688,6 +7267,15 @@ local function demoDash(char: Model, hrp: BasePart, look: Vector3)
 	end)
 end
 
+-- BlinkStep is visuals only too. The demo teleports the root 18 studs (short of walls) while the body is hidden.
+local function blinkTarget(char: Model, hrp: BasePart, look: Vector3): Vector3
+	local params = RaycastParams.new()
+	params.FilterDescendantsInstances = { char }
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local hit = Workspace:Raycast(hrp.Position, look * 19, params)
+	return hrp.Position + look * (if hit then math.max(0, (hit.Position - hrp.Position).Magnitude - 2) else 18)
+end
+
 local function cast(fx: string)
 	local char = player.Character
 	local hrp = char and char:FindFirstChild("HumanoidRootPart")
@@ -4711,6 +7299,36 @@ local function cast(fx: string)
 		end
 		h = waku.play(fx, hrp.CFrame, { caster = char })
 		aura = h
+	elseif fx == "RiftGate" or fx == "WardShell" then
+		local old = held[fx]
+		if old and old.alive() then
+			old.stop() -- plays the fold / the shatter
+			held[fx] = nil
+			return
+		end
+		if fx == "RiftGate" then
+			local g = groundUnder(char, hrp.Position + look * 14)
+			local c = g + Vector3.new(0, 8.5, 0)
+			h = waku.play(fx, CFrame.lookAt(c, c - look)) -- facing the player
+		else
+			h = waku.play(fx, hrp.CFrame, { caster = char })
+		end
+		held[fx] = h
+	elseif fx == "QuakeSlam" then
+		h = waku.play(fx, CFrame.lookAt(hrp.Position + look * 9, hrp.Position + look * 10))
+	elseif fx == "BlinkStep" then
+		local to = blinkTarget(char, hrp, look)
+		h = waku.play(fx, CFrame.lookAt(hrp.Position, hrp.Position + look), { caster = char, to = to })
+		if h then
+			task.delay(0.2, function() -- inside the 0.16-0.31 s gap, while the body is hidden
+				if hrp.Parent then
+					hrp.CFrame = hrp.CFrame.Rotation + to
+					hrp.AssemblyLinearVelocity = Vector3.zero
+				end
+			end)
+		end
+	elseif fx == "Fireball" then
+		h = waku.play(fx, CFrame.lookAt(hrp.Position, hrp.Position + look))
 	elseif fx == "HitBurst" then
 		combo += 1
 		h = waku.play(fx, CFrame.lookAt(front, front + look), { seed = combo })
@@ -4776,12 +7394,12 @@ end
       </Item>
     </Item>
   </Item>
-  <Item class="Workspace" referent="23">
+  <Item class="Workspace" referent="28">
     <Properties>
       <string name="Name">Workspace</string>
       <bool name="NeedsPivotMigration">false</bool>
     </Properties>
-    <Item class="Part" referent="24">
+    <Item class="Part" referent="29">
       <Properties>
         <string name="Name">Baseplate</string>
         <bool name="Anchored">true</bool>
@@ -4800,7 +7418,7 @@ end
         <token name="TopSurface">0</token>
       </Properties>
     </Item>
-    <Item class="SpawnLocation" referent="25">
+    <Item class="SpawnLocation" referent="30">
       <Properties>
         <string name="Name">SpawnLocation</string>
         <bool name="Anchored">true</bool>

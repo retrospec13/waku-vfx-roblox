@@ -1,6 +1,7 @@
 --!strict
 -- wakuVFX demo: press 1 PrismCleave, 2 CrystalBloom, 3 StormLance, 4 EarthRise on your own character (gamepad: X/Y/B/A),
--- 5 ChargeAura (press again to drop it), 6 HitBurst, 7 ChargeBeam, 8 GhostDash, 9 ImpactFlash (keyboard only).
+-- 5 ChargeAura (press again to drop it), 6 HitBurst, 7 ChargeBeam, 8 GhostDash, 9 ImpactFlash (keyboard only),
+-- Z QuakeSlam, X BlinkStep, C RiftGate (press again to close it), V WardShell (press again to burst it), B Fireball.
 -- Client-only visuals. For multiplayer, send one RemoteEvent and call waku.play on every client.
 local ContextActionService = game:GetService("ContextActionService")
 local Players = game:GetService("Players")
@@ -22,9 +23,15 @@ local BIND = {
 	{ fx = "ChargeBeam", keys = { Enum.KeyCode.Seven }, title = "Beam" },
 	{ fx = "GhostDash", keys = { Enum.KeyCode.Eight }, title = "Dash" },
 	{ fx = "ImpactFlash", keys = { Enum.KeyCode.Nine }, title = "Impact" },
+	{ fx = "QuakeSlam", keys = { Enum.KeyCode.Z }, title = "Quake" },
+	{ fx = "BlinkStep", keys = { Enum.KeyCode.X }, title = "Blink" },
+	{ fx = "RiftGate", keys = { Enum.KeyCode.C }, title = "Gate" },
+	{ fx = "WardShell", keys = { Enum.KeyCode.V }, title = "Ward" },
+	{ fx = "Fireball", keys = { Enum.KeyCode.B }, title = "Fire" },
 }
 local POSED = { PrismCleave = true, StormLance = true, EarthRise = true, ChargeBeam = true } -- one posed clone at a time
 local aura: any = nil
+local held: { [string]: any } = {} -- RiftGate / WardShell: the second press stops the one that is up
 local combo = 0
 local busy: { [string]: boolean } = {}
 
@@ -55,6 +62,15 @@ local function demoDash(char: Model, hrp: BasePart, look: Vector3)
 	end)
 end
 
+-- BlinkStep is visuals only too. The demo teleports the root 18 studs (short of walls) while the body is hidden.
+local function blinkTarget(char: Model, hrp: BasePart, look: Vector3): Vector3
+	local params = RaycastParams.new()
+	params.FilterDescendantsInstances = { char }
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local hit = Workspace:Raycast(hrp.Position, look * 19, params)
+	return hrp.Position + look * (if hit then math.max(0, (hit.Position - hrp.Position).Magnitude - 2) else 18)
+end
+
 local function cast(fx: string)
 	local char = player.Character
 	local hrp = char and char:FindFirstChild("HumanoidRootPart")
@@ -78,6 +94,36 @@ local function cast(fx: string)
 		end
 		h = waku.play(fx, hrp.CFrame, { caster = char })
 		aura = h
+	elseif fx == "RiftGate" or fx == "WardShell" then
+		local old = held[fx]
+		if old and old.alive() then
+			old.stop() -- plays the fold / the shatter
+			held[fx] = nil
+			return
+		end
+		if fx == "RiftGate" then
+			local g = groundUnder(char, hrp.Position + look * 14)
+			local c = g + Vector3.new(0, 8.5, 0)
+			h = waku.play(fx, CFrame.lookAt(c, c - look)) -- facing the player
+		else
+			h = waku.play(fx, hrp.CFrame, { caster = char })
+		end
+		held[fx] = h
+	elseif fx == "QuakeSlam" then
+		h = waku.play(fx, CFrame.lookAt(hrp.Position + look * 9, hrp.Position + look * 10))
+	elseif fx == "BlinkStep" then
+		local to = blinkTarget(char, hrp, look)
+		h = waku.play(fx, CFrame.lookAt(hrp.Position, hrp.Position + look), { caster = char, to = to })
+		if h then
+			task.delay(0.2, function() -- inside the 0.16-0.31 s gap, while the body is hidden
+				if hrp.Parent then
+					hrp.CFrame = hrp.CFrame.Rotation + to
+					hrp.AssemblyLinearVelocity = Vector3.zero
+				end
+			end)
+		end
+	elseif fx == "Fireball" then
+		h = waku.play(fx, CFrame.lookAt(hrp.Position, hrp.Position + look))
 	elseif fx == "HitBurst" then
 		combo += 1
 		h = waku.play(fx, CFrame.lookAt(front, front + look), { seed = combo })

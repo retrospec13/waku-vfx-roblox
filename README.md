@@ -1,6 +1,8 @@
 # waku-vfx-roblox
 
-**[Set 2: five new effects, SFX and setup](docs/SET-2.md)** · [Set 1 trailer](media/wakuVFX_trailer.mp4)
+**[Set 3: five over-the-top effects](docs/SET-3.md)** · [Set 3 full trailer](media/set-3-trailer.mp4) · **[Set 2: five new effects, SFX and setup](docs/SET-2.md)** · [Set 1 trailer](media/wakuVFX_trailer.mp4)
+
+[![Set 3: five effects in five seconds](media/set-3-preview.gif)](docs/SET-3.md)
 
 [![Set 2 preview](media/set-2-preview.gif)](docs/SET-2.md)
 
@@ -8,7 +10,7 @@
 
 **[Watch the trailer](media/wakuVFX_trailer.mp4)** · [Download the MP4](media/wakuVFX_trailer.mp4?raw=true)
 
-Nine editable, client-side Roblox combat effects from **Waku Worldwide**. Built from parts, beams, particles and procedural R15 poses, with no mesh or animation uploads required. GitHub may offer the trailer as a download rather than an inline player.
+Fourteen editable, client-side Roblox combat effects from **Waku Worldwide**. Built from parts, beams, particles and procedural R15 poses, with no mesh or animation uploads required. GitHub may offer the trailer as a download rather than an inline player.
 
 | Effect | Motion |
 |---|---|
@@ -21,22 +23,28 @@ Nine editable, client-side Roblox combat effects from **Waku Worldwide**. Built 
 | **ChargeBeam** | 0.45 s gather in the hands, then a 0.6 s thick beam with core, sheath, spiral strands, muzzle flare and end burst |
 | **GhostDash** | Five sharp afterimages of the caster's real pose plus a short speed trail. Visuals only: your game moves the character |
 | **ImpactFlash** | Two-frame black/white then inverted impact frame (0.07 s), then colour slams back with a shockwave |
+| **QuakeSlam** | A falling comet, white-out ground slam, light pillar, a star of glowing cracks, black lightning and thrown rock |
+| **BlinkStep** | The caster vanishes into a seam of light and returns under a lightning pillar. Visuals only: your game moves the character |
+| **RiftGate** | A standing portal burned into the air, with a swirling interior; holds until `handle.stop()` folds it shut (4.7 s if left alone) |
+| **WardShell** | A lattice guard bubble that follows the caster, takes two hits, cracks and shatters; `handle.stop()` bursts it early (3.4 s if left alone) |
+| **Fireball** | Charge flare, a house-sized fireball with a flame tail and a fire-dome explosion. `rainbow = false, hue = 0.03` gives plain orange fire |
 
 ## Included
 
-- All nine effect modules, shared runtime, R15 pose code and demo controls.
+- All fourteen effect modules, shared runtime, R15 pose code and demo controls.
 - `wakuVFX_demo.rbxlx`, plus demo and library-only Rojo projects.
 - All **16 PNG textures**, their manifest and editable Python generator.
 - [A runnable new-effect walkthrough](docs/NEW_EFFECT.md), optional assistant skill and [test instructions](TESTS.md).
-- Both trailers and preview GIFs.
+- The Set 1, Set 2 and Set 3 trailers and preview GIFs.
 - Set 2 ElevenLabs SFX in `audio/`, plus optional `Sounds.luau` playback and demo integration. See [Set 2 audio setup](docs/SET-2.md#elevenlabs-sfx-and-playback).
-- Capture and trailer editing tools are not part of this source kit.
+- Set 3 ElevenLabs source takes (`audio/raw/s3_*.mp3`) and prepared clips (`audio/mix/s3_*.mp3`); see [Set 3](docs/SET-3.md#sfx).
+- The optional capture and trailer scripts are described in [docs/PIPELINE.md](docs/PIPELINE.md). The three AI trailer clips are included under `trailer/hf/`. The Studio source captures are not included, so the scripts cannot rebuild the supplied trailer from this repository alone.
 
 ## Quick start
 
 1. Open `wakuVFX_demo.rbxlx` in Roblox Studio.
 2. **Upload your own copies of the included textures and replace the IDs**, as below.
-3. Use an R15 avatar, press **Play**, then **1 / 2 / 3 / 4**. Gamepad: X / Y / B / A. Touch: on-screen buttons. Keys **5 to 9** play ChargeAura (press again to drop it), HitBurst, ChargeBeam, GhostDash and ImpactFlash.
+3. Use an R15 avatar, press **Play**, then **1 / 2 / 3 / 4**. Gamepad: X / Y / B / A. Touch: on-screen buttons. Keys **5 to 9** play ChargeAura (press again to drop it), HitBurst, ChargeBeam, GhostDash and ImpactFlash. Keys **Z X C V B** play QuakeSlam, BlinkStep, RiftGate, WardShell and Fireball (press C or V again to close the gate or burst the shell).
 
 To use the kit in an existing game, copy **the `ReplicatedStorage.wakuVFX` ModuleScript with all its children** from the demo. It is not a plain Folder. Call it from a LocalScript:
 
@@ -52,7 +60,7 @@ local handle = waku.play("PrismCleave", hrp.CFrame, { caster = character })
 -- EarthRise expects a ground CFrame facing the eruption direction.
 ```
 
-One active pose owns each caster. A second overlapping posed call returns `nil`, warns and records a build error; it does not interrupt the first. Stop the first handle or wait until `handle.alive()` is false before starting the next. Different casters can run concurrently. CrystalBloom does not pose a caster.
+One active pose or BlinkStep hide owns each caster. An overlapping call that needs that same lock returns `nil`, warns and records a build error; it does not interrupt the first. Stop the first handle or wait until `handle.alive()` is false before starting the next. Different casters can run concurrently. CrystalBloom does not pose a caster.
 
 These are visuals, not damage, authoritative movement or replication. PrismCleave moves a clone; the real character returns in place. Implement server-validated gameplay and client effect dispatch in your own game.
 
@@ -69,8 +77,13 @@ These are visuals, not damage, authoritative movement or replication. PrismCleav
 | ChargeBeam | Authored size scaling | Base palette controls | R15 pose | Not used |
 | GhostDash | Authored size scaling | Base palette controls | Copied for afterimages, not posed | Not used |
 | ImpactFlash | Authored size scaling | Base palette controls | Silhouetted, not posed | Skips the black/white frames |
+| QuakeSlam | Authored size scaling | Base palette controls | Not used | Not used |
+| BlinkStep | Authored size scaling | Base palette controls | Hidden for the gap, not posed | Not used |
+| RiftGate | Authored size scaling | Base palette controls | Not used | Not used |
+| WardShell | Authored size scaling | Base palette controls | Followed, not posed | Not used |
+| Fireball | Authored size scaling | `rainbow=false` gives single-hue fire | Not used | Not used |
 
-`cf` conventions for the newer five: ChargeAura takes the caster's root CFrame; HitBurst and ImpactFlash take the contact point with LookVector along the blow; ChargeBeam and GhostDash take the caster's root CFrame facing the shot or dash. ChargeBeam raycasts up to 70 studs and ends on what it hits. ImpactFlash's two frame grades are tunable in `ImpactFlash.FRAME1` / `FRAME2`.
+`cf` conventions and options for Set 3 are in [docs/SET-3.md](docs/SET-3.md#calling-them). `cf` conventions for the Set 2 five: ChargeAura takes the caster's root CFrame; HitBurst and ImpactFlash take the contact point with LookVector along the blow; ChargeBeam and GhostDash take the caster's root CFrame facing the shot or dash. ChargeBeam raycasts up to 70 studs and ends on what it hits. ImpactFlash's two frame grades are tunable in `ImpactFlash.FRAME1` / `FRAME2`.
 
 `rainbow=false` stops base-hue time cycling; spatial rainbow offsets remain. `hue=0.55` is a palette offset, **not a uniform fixed colour**. Scaling is authored per effect, not a universal character/world transform. `seed` controls seeded variation (default 7). `waku.timeScale` is nil/1 for normal playback, 0.5 for slow motion, 0 for screenshots. There is no shipped fixed-step capture API.
 
